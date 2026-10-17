@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 9 章 — 扩展、注册表与 Agent 配置</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ pi-durable 源码导读</a>
+  <span class="crumb">第 9 章 · 扩展与 Agent</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="9">
+<script>window.BOOK_CONFIG = { slug: "pi-durable", lang: "zh", chapters: [{n:1,slug:"01-what-and-why"},{n:2,slug:"02-core-concepts"},{n:3,slug:"03-quick-start"},{n:4,slug:"04-storage-and-resume"},{n:5,slug:"05-api-panorama"},{n:6,slug:"06-commit-and-documents"},{n:7,slug:"07-tasks"},{n:8,slug:"08-tools-and-env"},{n:9,slug:"09-extensions-and-agent"},{n:10,slug:"10-inbox-watch-errors"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 9 章 · 组装</div>
+    <h1>扩展（Extension）、注册表（Registry）与 Agent 配置</h1>
+    <p class="lede">
+      前面八章的零件 —— 工具、提示词段落、钩子、任务 —— 都靠扩展打包分发。
+      本章讲清：扩展是什么、注册表怎么装、会话怎么按名字选用（以及为什么存名字不存对象）、
+      system prompt 怎么拼、hooks 怎么拦截内置任务、以及热重载的边界在哪里。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能写出带 tools / sections / hooks / wraps 的扩展并装进注册表</li>
+      <li>能解释「注册表不落盘、会话存名字」的设计，以及卸载-重装的后果</li>
+      <li>能用 section() 写提示词段落，并说明位置化 pi.system 条目为何能保温 prompt 缓存</li>
+      <li>能用 configure() 的数组/对象/null 三种形式精确表达 agent 变更</li>
+      <li>能给三类内置任务挂钩子，并说出钩子抛错的后果</li>
+      <li>能描述热重载规则：已在跑的调用用旧代码，下一个相位/请求用新代码</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-extension">9.1 扩展：命名的能力包</h2>
+  <pre><code>import { defineExtension, defineTool, hook, section, ToolTask } from "@earendil-works/pi-durable";
+
+const Coding = defineExtension({
+	name: "coding",                       // 唯一身份：注册与选择都靠它
+	tools: [/* ToolRegistration ... */],   // 提供工具
+	sections: [                            // 提示词段落（按序渲染）
+		section("preamble", () =&gt; "You are a concise coding assistant.", { tag: false }),
+	],
+	hooks: [                               // 拦截内置任务
+		hook(ToolTask, { beforeTool: (call) =&gt; isDangerous(call) ? { block: "Needs approval" } : undefined }),
+	],
+	wraps: [/* 装饰别人同名工具/同名段落 */],
+	tasks: [/* AnyTask ... */],            // 提供任务定义（按名解析，与选择无关）
+});
+
+const registry = createRegistry();
+registry.install(CodingTools);   // 内置编码工具扩展
+registry.install(Coding);</code></pre>
+  <p>
+    一条容易被忽略的规则：<strong>注册表里什么都不落盘，会话的 pi.agent 里存的是扩展名字</strong>。
+    于是名字比代码活得久 —— 卸载某扩展后，选了它的会话只是暂时拿不到它，等重新安装同名扩展又恢复。
+    默认每个会话按<strong>安装顺序</strong>选择全部已安装扩展；同名工具后者覆盖前者（装得晚的赢）。
+  </p>
+
+  <h2 id="sec-registry">9.2 注册表：装、卸、热替换</h2>
+  <ul>
+    <li><code>registry.install(ext)</code> — 新名字追加；<strong>同名原地替换</strong>（一步完成，无中间态）。这就是热重载的实现机制。</li>
+    <li><code>registry.uninstall(ext)</code> — 按 <code>ext.name</code> 移除已装的（不管传进来的对象是不是当年那个）。再装同名的会排到后面。</li>
+    <li>Harness 每次用时从 <code>registry.snapshot()</code> 拿<strong>不可变快照</strong> —— 一个相位/一次请求内代码固定，快照之间可以变。注册表变化会同步唤醒调度器重新考虑被 blocked 的任务。</li>
+  </ul>
+  <p><strong>热重载边界</strong>（README Reload 一节）：已经开始的工作带着它启动时的代码跑完 —— 执行中的工具调用在旧实现下结束；每个任务相位开始时解析一次钩子与 agent。下一个相位、下一次请求、下一个调用用新代码。重启进程后要重新 install 一遍；某扩展 tasks 的 pending 任务等它装回来才恢复。</p>
+
+  <h2 id="sec-sections">9.3 系统提示词：段落拼装与缓存友好</h2>
+  <p>每次请求前，所选扩展的 sections 按序渲染，会话自己的 instructions 最后作为段落 <code>instructions</code> 渲染。段落签名：</p>
+  <pre><code>section("cwd", (input) =&gt; input.env?.cwd);
+// input: { conversationId, agent, env, shown, read }
+// 返回 undefined 则省略该段；默认以 &lt;cwd&gt;...&lt;/cwd&gt; 包裹（tag: false 关闭）</code></pre>
+  <p>
+    <strong>位置化的 pi.system 条目</strong>：sections 与工具集的变化被存成转录里的系统条目，
+    请求时<strong>只重发变化的部分</strong>。这是刻意讨好提供商的 prompt 缓存：前缀不变，缓存命中。
+    推论：一个每次返回不同内容的段落（比如当前时间）会击穿缓存 —— 把这类信息放进 instructions
+    或让它稳定，是使用者的责任。
+  </p>
+
+  <h2 id="sec-agent">9.4 pi.agent 与 configure()：会话跑什么的唯一事实</h2>
+  <p>每个会话把「跑什么」存在 <code>pi.agent</code>（<code>src/harness/agent.ts:43</code>）。未设置的字段跟随宿主（settings 的默认选择）。<code>configure(change)</code> 用一个 commit 改它，三种形式各有语义：</p>
+  <pre><code>await root.configure({
+	model: { provider: "openai", modelId: "gpt-6-sol" },   // 给定字段：整体替换
+	thinkingLevel: "high",
+	extensions: { remove: [Coding] },   // 对象：编辑宿主默认选择（add / remove）
+	tools: [readTool, bashTool],        // 数组：精确启用这些（按序）
+	modelTools: [readTool],             // 缩窄给模型的名单（第 8 章）
+	instructions: "Only read; never edit files.",
+	cwd: "/work/repo",
+}, context);
+await root.configure({ tools: null }, context);            // null：清回宿主默认
+const agent = await root.agent(context);                    // 解析结果（含 tools/callable/deferred）</code></pre>
+  <ul>
+    <li>数组 = 「精确就是这些，按此顺序」；对象 = 「在默认之上增删」；null = 「清空，回到默认」。三个动词三种形状，记牢少踩坑。</li>
+    <li><strong>请求级固定</strong>：一次请求的模型、prompt、提供的工具在它准备时就固定了，configure 从下一次请求生效。</li>
+    <li><strong>继承</strong>：任务拥有的子会话从 owner 会话复制 agent 起步；fork 拿父会话在分叉条目时的 agent。</li>
+    <li>扩展与工具都<strong>按对象传入、按名字存储</strong> —— 与注册表同一套哲学。</li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="agent 解析管线">
+      <text x="410" y="24" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">一次请求的 agent 解析：存储的名字 × 注册表快照 × settings</text>
+      <rect x="30" y="50" width="200" height="80" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="130" y="75" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">pi.agent（存储）</text>
+      <text x="130" y="95" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">model / extensions 名单 /</text>
+      <text x="130" y="111" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">tools / modelTools / cwd</text>
+      <rect x="300" y="50" width="200" height="80" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="400" y="75" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">registry.snapshot()</text>
+      <text x="400" y="95" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">已装扩展（可热变）：</text>
+      <text x="400" y="111" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">工具 / 段落 / 钩子 / 任务</text>
+      <rect x="570" y="50" width="220" height="80" rx="10" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="680" y="75" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">settings（每次读）</text>
+      <text x="680" y="95" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">默认扩展选择 / stream /</text>
+      <text x="680" y="111" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">retry / compaction / 队列模式</text>
+      <line x1="230" y1="90" x2="292" y2="90" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="298,90 288,85 288,95" style="fill:var(--muted)"/>
+      <line x1="500" y1="90" x2="562" y2="90" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="568,90 558,85 558,95" style="fill:var(--muted)"/>
+      <line x1="410" y1="130" x2="410" y2="165" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="410,172 405,162 415,162" style="fill:var(--muted)"/>
+      <rect x="230" y="175" width="360" height="100" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="410" y="200" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">解析后的 Agent（本次请求固定）</text>
+      <text x="410" y="222" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">model / thinkingLevel / extensions（对象）</text>
+      <text x="410" y="240" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">tools（给模型）/ callable（给程序）/ deferred（可加载）</text>
+      <text x="410" y="258" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">sections + instructions / cwd</text>
+    </svg>
+    <figcaption>存储存名字、注册表给肉身、settings 给默认 —— 三者在每次使用时合成一个请求内固定的 Agent。</figcaption>
+  </figure>
+
+  <h2 id="sec-hooks">9.5 Hooks：拦截内置任务</h2>
+  <p>钩子按任务种类挂（<code>hook(Task, handlers)</code>，按定义名匹配），只在选择其扩展的会话生效：</p>
+  <ul>
+    <li>
+      <strong>工具钩子（ToolHooks，<code>types.ts:792-806</code>）</strong>：
+      <code>beforeTool(call, api, ctx)</code> — 阻止（<code>{ block: "理由" }</code>，首个阻止获胜）或改写参数（<code>{ arguments: {...} }</code>）；抛异常 = 阻止。
+      <code>afterTool(call, result, api, ctx)</code> — 替换结果（比如脱敏 —— 注意声明了 schema 的工具要连 structuredOutput 一起脱）。
+      嵌套调用的 <code>call.parent</code> 标记了它来自另一个工具。
+    </li>
+    <li>
+      <strong>生成钩子（GenerationHooks，<code>types.ts:771-784</code>）</strong>：
+      <code>beforeRequest</code>（换掉本次请求的消息）、<code>afterResponse</code>（每个终态 provider 消息）、
+      <code>onYield</code>（对最终回答说「继续干」：<code>{ continue: UserInput }</code>）、<code>afterTools</code>（一轮工具全部终态后）。
+    </li>
+    <li>
+      <strong>压缩钩子（CompactionHooks，<code>types.ts:809-826</code>）</strong>：
+      <code>beforeCompact</code> — 拒绝（<code>{ decline: true }</code>）或自带摘要（<code>{ summary }</code>），第 10 章配合压缩阈值使用。
+    </li>
+  </ul>
+  <p><code>HookApi</code> 给钩子的能力（<code>types.ts:758-766</code>）：文档读、<code>taskId / conversationId</code>、<code>models</code>、以及与任务共享的 <code>memo</code>。钩子抛错<strong>只废自己</strong>：被上报（onReport）后跳过，beforeTool 抛错视为阻止 —— 内置工作不因扩展bug而停摆。</p>
+
+  <h2 id="sec-wraps">9.6 wrapTool / wrapSection：装饰赢家</h2>
+  <pre><code>const Timing = defineExtension({
+	name: "timing",
+	wraps: [wrapTool(bashTool, (bash) =&gt; ({
+		...bash,
+		execute: (args, api, ctx) =&gt; timed(() =&gt; bash.execute(args, api, ctx)),
+	}))],
+});</code></pre>
+  <p>包装器作用于「同名的最终赢家」—— 先被覆盖再被包装，顺序不乱。<strong>包装器必须是纯函数</strong>（每次重新应用，不能带跨调用状态）。</p>
+
+  <h2 id="sec-recap">9.7 本章回顾</h2>
+  <ul>
+    <li>扩展 = name + tools + sections + hooks + wraps + tasks 的命名包；注册表可热变，快照保稳定。</li>
+    <li>存储只存名字：卸载是「暂时消失」，重装即恢复；同名工具后装覆盖，包装器装饰赢家。</li>
+    <li>提示词 = 扩展段落按序 + instructions 殿后；变化存成位置化 pi.system 条目，只重发送变化部分以保温缓存。</li>
+    <li>configure 三形式：数组（精确）、对象（增删）、null（清空）；请求准备时固化，下请求生效。</li>
+    <li>钩子三类，全部「首个决定获胜、抛错只废自己」；HookApi 带 memo 与文档读。</li>
+    <li>热重载边界：跑着的用旧代码跑完；重启后需要重新 install。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>期待 configure 立刻改变进行中的请求 —— 请求准备时已固定，下个请求才轮到你。</li>
+      <li>段落里渲染当前时间 —— 每次都变，prompt 缓存全穿。</li>
+      <li>afterTool 只脱敏 output 忘了 structuredOutput —— 程序侧拿到原文。</li>
+      <li>以为钩子抛错会中止 run —— 只废该钩子，beforeTool 的抛错等价阻止该次调用。</li>
+      <li>改了扩展实现却不重启进程也不 reinstall —— pending 的该扩展任务永远 blocked（定义名找不到新版本）。</li>
+      <li>用 === 比较扩展/工具对象判断是否选择 —— 会话存的是名字，用 configure 的对象参数让框架按名处理。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="9">
+    <h2>第 9 章测试</h2>
+
+    <div class="q" data-id="9-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — 名字。注册表不落盘，会话存扩展名，按名对注册表解析。"
+         data-rationale="B 正是「stored as names」设计。A/C/D 都与存储策略相反，也解释不了卸载重装后恢复的现象。"
+         data-review="sec-extension">
+      <div class="prompt"><span class="qnum">Q1.</span> 会话的 pi.agent 里，扩展以什么形式存储？</div>
+      <label class="opt"><input type="radio" name="q-9-1" value="a"> A. 扩展对象的序列化</label>
+      <label class="opt"><input type="radio" name="q-9-1" value="b"> B. 扩展名字 —— 名字比对注册表快照解析</label>
+      <label class="opt"><input type="radio" name="q-9-1" value="c"> C. 工具函数的哈希</label>
+      <label class="opt"><input type="radio" name="q-9-1" value="d"> D. 什么也不存，每次全局选择</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-2" data-type="mcq" data-correct='["a"]'
+         data-answer="A — 同名原地替换，一步完成；这就是热重载。"
+         data-rationale="A 正确（Reload 一节）。B 会留下选择缺口；C/D 不是 install 的行为。"
+         data-review="sec-registry">
+      <div class="prompt"><span class="qnum">Q2.</span> 对已安装扩展的名字再次 install 一个新实现，会发生什么？</div>
+      <label class="opt"><input type="radio" name="q-9-2" value="a"> A. 原地替换（一步完成），后续相位/请求用新代码</label>
+      <label class="opt"><input type="radio" name="q-9-2" value="b"> B. 抛错：名字冲突</label>
+      <label class="opt"><input type="radio" name="q-9-2" value="c"> C. 追加第二个同名扩展</label>
+      <label class="opt"><input type="radio" name="q-9-2" value="d"> D. 忽略本次安装</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C — 只重发送变化部分，保持前缀稳定，提供商 prompt 缓存得以命中。"
+         data-rationale="C 正确（System Prompt 一节）。A/B 恰是浪费缓存的做法；D 与发送策略无关。"
+         data-review="sec-sections">
+      <div class="prompt"><span class="qnum">Q3.</span> 提示词段落与工具集变化存成位置化 pi.system 条目的直接好处是？</div>
+      <label class="opt"><input type="radio" name="q-9-3" value="a"> A. 省磁盘空间</label>
+      <label class="opt"><input type="radio" name="q-9-3" value="b"> B. 让模型回答更快</label>
+      <label class="opt"><input type="radio" name="q-9-3" value="c"> C. 请求只重发送变化部分，前缀不变，保温提供商 prompt 缓存</label>
+      <label class="opt"><input type="radio" name="q-9-3" value="d"> D. 避免条目不可变规则</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-4" data-type="mcq" data-correct='["b"]'
+         data-answer="B — extensions: { remove: [Coding] } —— 对象形式编辑宿主默认选择。"
+         data-rationale="B 正确：对象 = 增删默认。A 的数组形式意为「精确只选这些」；C 中 null 意为清空回默认；D 是不存在的写法。"
+         data-review="sec-agent">
+      <div class="prompt"><span class="qnum">Q4.</span> 想让某会话「在宿主默认扩展基础上少一个 Coding」，configure 应写？</div>
+      <label class="opt"><input type="radio" name="q-9-4" value="a"> A. extensions: [其他全部扩展]</label>
+      <label class="opt"><input type="radio" name="q-9-4" value="b"> B. extensions: { remove: [Coding] }</label>
+      <label class="opt"><input type="radio" name="q-9-4" value="c"> C. extensions: null</label>
+      <label class="opt"><input type="radio" name="q-9-4" value="d"> D. extensions: { only: Coding }</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-5" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A/B/D 都是 GenerationHooks 的成员。beforeTool 属于工具钩子；beforeCompact 属于压缩钩子。"
+         data-review="sec-hooks">
+      <div class="prompt"><span class="qnum">Q5.</span> 以下哪些属于生成任务（GenerationTask）的钩子？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-9-5" value="a"> A. beforeRequest</label>
+      <label class="opt"><input type="checkbox" name="q-9-5" value="b"> B. onYield</label>
+      <label class="opt"><input type="checkbox" name="q-9-5" value="c"> C. beforeTool</label>
+      <label class="opt"><input type="checkbox" name="q-9-5" value="d"> D. afterTools</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-6" data-type="mcq" data-correct='["c"]'
+         data-answer="C — 该钩子被上报并跳过；beforeTool 抛错等价于阻止该次调用，运行继续。"
+         data-rationale="C 正确（错误规则三：你的代码只废自己的单元）。A/B/D 都夸大了爆炸半径。"
+         data-review="sec-hooks">
+      <div class="prompt"><span class="qnum">Q6.</span> 一个 beforeTool 钩子抛了未捕获异常，后果是？</div>
+      <label class="opt"><input type="radio" name="q-9-6" value="a"> A. 整个 Harness 关闭</label>
+      <label class="opt"><input type="radio" name="q-9-6" value="b"> B. 该工具任务 faulted</label>
+      <label class="opt"><input type="radio" name="q-9-6" value="c"> C. 钩子被上报后跳过；对 beforeTool 而言该次调用被阻止</label>
+      <label class="opt"><input type="radio" name="q-9-6" value="d"> D. 会话被 abort</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-7" data-type="fill" data-accepted='["instructions","会话 instructions"]'
+         data-answer="instructions"
+         data-rationale="会话的 instructions 作为名为 instructions 的段落最后渲染，排在所有扩展段落之后。"
+         data-review="sec-sections">
+      <div class="prompt"><span class="qnum">Q7.</span> 填空：会话自己的指令作为名为 <code>______</code> 的段落，在所有扩展段落之后渲染。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-8" data-type="mcq" data-correct='["d"]'
+         data-answer="D — 任务拥有的子会话从 owner 会话的 agent 复制起步。"
+         data-rationale="D 正确（Per-Conversation Agent 一节）。A 与设计相反（未设字段才跟宿主）；B/C 无此机制。"
+         data-review="sec-agent">
+      <div class="prompt"><span class="qnum">Q8.</span> 一个被任务拥有的子会话（子代理）创建时，它的 agent 来自哪里？</div>
+      <label class="opt"><input type="radio" name="q-9-8" value="a"> A. 强制用宿主默认</label>
+      <label class="opt"><input type="radio" name="q-9-8" value="b"> B. 随机模型</label>
+      <label class="opt"><input type="radio" name="q-9-8" value="c"> C. 根会话的配置</label>
+      <label class="opt"><input type="radio" name="q-9-8" value="d"> D. 复制其 owner 会话的 agent，再按 configure 修改</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-9" data-type="mcq" data-correct='["a"]'
+         data-answer="A — 包装器装饰「同名竞争中获胜的那个工具」，且必须纯函数。"
+         data-rationale="A 正确（wrapTool 一节：decorates whichever tool won）。B/C/D 与覆盖-包装顺序或纯度要求矛盾。"
+         data-review="sec-wraps">
+      <div class="prompt"><span class="qnum">Q9.</span> 两个扩展都提供 bash，第三个扩展 wrapTool(bashTool, w)。包装器作用在谁身上？</div>
+      <label class="opt"><input type="radio" name="q-9-9" value="a"> A. 覆盖竞争的胜者（后装的同名工具）</label>
+      <label class="opt"><input type="radio" name="q-9-9" value="b"> B. 先装的那个</label>
+      <label class="opt"><input type="radio" name="q-9-9" value="c"> C. 两个都被包装</label>
+      <label class="opt"><input type="radio" name="q-9-9" value="d"> D. 报错：歧义</label>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测试</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测试</button>
+  </form>
+
+  <p style="margin-top:2rem; color:var(--muted);">
+    下一章：<a href="10-inbox-watch-errors.html"><strong>第 10 章 — 提交队列、观看、压缩与错误模型</strong></a>，终章。
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

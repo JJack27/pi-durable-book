@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 7 章 — Task：持久状态机与所有权</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ pi-durable 源码导读</a>
+  <span class="crumb">第 7 章 · Task</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="7">
+<script>window.BOOK_CONFIG = { slug: "pi-durable", lang: "zh", chapters: [{n:1,slug:"01-what-and-why"},{n:2,slug:"02-core-concepts"},{n:3,slug:"03-quick-start"},{n:4,slug:"04-storage-and-resume"},{n:5,slug:"05-api-panorama"},{n:6,slug:"06-commit-and-documents"},{n:7,slug:"07-tasks"},{n:8,slug:"08-tools-and-env"},{n:9,slug:"09-extensions-and-agent"},{n:10,slug:"10-inbox-watch-errors"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 7 章 · 深潜之二</div>
+    <h1>Task：持久状态机与所有权树</h1>
+    <p class="lede">
+      任务是 pi-durable 里"能干活的最小持久单位"。回答模型、执行工具、压缩摘要这些内置行为
+      全部是任务 —— 学会任务，你就看穿了这台机器的心脏。本章覆盖：任务定义的解剖、
+      五种状态与五种结局、检查点纪律（不提交进度 = 故障）、等待与子任务、中止的级联，
+      以及子代理这个最重要的应用模式。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能用 defineTask 写出多阶段任务，并解释 initial / phases / abort / migrate 各自的职责</li>
+      <li>能背出 TaskState 五态与 TaskOutcome 五种结局的含义</li>
+      <li>能说清检查点纪律：阶段处理器必须提交新状态，否则任务 faulted</li>
+      <li>能用 waiting + on + policy（failFast / allSettled）编排子任务</li>
+      <li>能解释所有权树上的中止级联与 background / abandonOnRestart 两个逃生门</li>
+      <li>能读懂 README 的子代理工具模式并复述它为什么 replay: safe</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-define">7.1 任务定义的解剖</h2>
+  <pre><code>import { defineTask } from "@earendil-works/pi-durable"; // src/tasks.ts:4
+
+const Payment = defineTask&lt;
+	{ card: string },                      // I：输入（不可变，任务存活期间一直带着）
+	{ phase: "charge" } | { phase: "capture"; txId: string } | { phase: "done" },  // S：检查点
+	{ receiptId: string },                 // R：成功结果
+	{ onCharge?: (txId: string) =&gt; void } // H：可选 hooks（第 9 章）
+&gt;({
+	name: "app.payment",       // 注册表里的种类名，存进 TaskRecord.kind
+	version: 1,                // 定义版本，配合 migrate 做在线升级
+	initial: (input) =&gt; ({ phase: "charge" }),        // 新任务的第一个检查点
+	phases: {                  // 相位映射：按 checkpoint.phase 精确分发
+		charge:  async (task, runtime, context) =&gt; { /* ... */ },
+		capture: async (task, runtime, context) =&gt; { /* ... */ },
+		done:    async (task, runtime, context) =&gt; { /* ... */ },
+	},
+	abort: async (task, runtime, context) =&gt; { /* 中止协议：清理外部效果，必须提交终态 */ },
+	migrate: (input, checkpoint, fromVersion) =&gt; ({ input, checkpoint }), // 可选
+});</code></pre>
+  <p>
+    记住一句话：<strong>检查点 S 里必须装下"从哪里继续"的全部信息</strong>。
+    <code>capture</code> 相位带着 <code>txId</code>，因为重启后从这里继续时，需要知道之前扣款的事务号。
+  </p>
+
+  <h2 id="sec-states">7.2 状态与结局</h2>
+  <p><code>TaskState</code>（<code>src/types.ts:503-537</code>）五态：</p>
+  <ul>
+    <li><code>pending</code> — 可调度，带完整检查点。</li>
+    <li><code>running</code> — 被某个存活进程的调用占用（重启对账后回 pending）。</li>
+    <li><code>waiting</code> — 停车场：等 <code>on</code> 列表里的任务全部终态；期间<strong>不跑任何代码</strong>。</li>
+    <li><code>completing</code> — 结局已定，但等它拥有的普通工作排空才转 terminal（见 7.4）。</li>
+    <li><code>terminal</code> — 永久回执。</li>
+  </ul>
+  <p><code>TaskOutcome</code>（<code>src/types.ts:466-500</code>）五种结局，注意它们的语义分工：</p>
+  <ul>
+    <li><code>completed</code> — 成功，带 <code>result</code>。</li>
+    <li><code>failed</code> — <strong>业务失败</strong>：任务代码自己提交的、预期内的失败（比如卡被拒），带 <code>error: { message, detail? }</code>。</li>
+    <li><code>aborted</code> — 被显式中止，走的是任务的 abort 协议，可带 reason。</li>
+    <li><code>orphaned</code> — 定义失踪：注册表里找不到能接手的定义（或迁移失败），只能坐以待毙地标孤儿。</li>
+    <li><code>faulted</code> — <strong>契约违约</strong>：阶段处理器抛了未捕获异常，或跑完却没提交任何持久进展。</li>
+  </ul>
+  <p><code>failed</code> 与 <code>faulted</code> 的区别是面试级考点：<strong>failed 是你声明的设计内失败，faulted 是运行时抓到的你违约</strong>。</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="任务状态机">
+      <text x="410" y="24" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">TaskState 状态机（虚线 = 崩溃/重启路径）</text>
+      <rect x="30" y="60" width="130" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="95" y="88" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">pending</text>
+      <rect x="230" y="60" width="130" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="295" y="88" text-anchor="middle" style="fill:var(--accent-2)" font-size="13" font-weight="700">running</text>
+      <rect x="430" y="60" width="130" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="495" y="82" text-anchor="middle" style="fill:var(--warn)" font-size="13" font-weight="700">waiting</text>
+      <text x="495" y="98" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">on: [] + policy</text>
+      <rect x="630" y="60" width="150" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="705" y="82" text-anchor="middle" style="fill:var(--pass)" font-size="13" font-weight="700">completing</text>
+      <text x="705" y="98" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">结局已定，等下属排空</text>
+      <rect x="630" y="180" width="150" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="2"/>
+      <text x="705" y="208" text-anchor="middle" style="fill:var(--fg)" font-size="13" font-weight="700">terminal</text>
+      <line x1="160" y1="83" x2="222" y2="83" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="228,83 218,78 218,88" style="fill:var(--muted)"/>
+      <text x="194" y="72" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">调度占用</text>
+      <line x1="360" y1="83" x2="422" y2="83" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="428,83 418,78 418,88" style="fill:var(--muted)"/>
+      <text x="394" y="72" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">提交 waiting</text>
+      <line x1="560" y1="83" x2="622" y2="83" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="628,83 618,78 618,88" style="fill:var(--muted)"/>
+      <text x="594" y="72" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">on 全终态后恢复</text>
+      <line x1="295" y1="106" x2="150" y2="106" style="stroke:var(--fail)" stroke-width="1.5" stroke-dasharray="5 4"/>
+      <polygon points="144,106 154,101 154,111" style="fill:var(--fail)"/>
+      <text x="222" y="122" text-anchor="middle" style="fill:var(--fail)" font-size="9">崩溃 → 重开对账（带检查点）</text>
+      <line x1="705" y1="106" x2="705" y2="172" style="stroke:var(--pass)" stroke-width="2"/>
+      <polygon points="705,178 700,168 710,168" style="fill:var(--pass)"/>
+      <text x="740" y="145" style="fill:var(--fg-dim)" font-size="9">下属排空</text>
+      <rect x="60" y="180" width="420" height="110" rx="10" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="270" y="205" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">terminal 的五种结局（TaskOutcome）</text>
+      <text x="80" y="230" style="fill:var(--pass)" font-size="10">completed(result) — 成功</text>
+      <text x="80" y="250" style="fill:var(--warn)" font-size="10">failed(error) — 任务自己声明的业务失败</text>
+      <text x="80" y="270" style="fill:var(--accent-2)" font-size="10">aborted(reason) — 中止协议处理后的取消</text>
+      <text x="290" y="230" style="fill:var(--muted)" font-size="10">orphaned(reason) — 定义失踪，无人能接</text>
+      <text x="290" y="250" style="fill:var(--fail)" font-size="10">faulted(error) — 抛异常 / 无持久进展</text>
+      <text x="290" y="275" style="fill:var(--fg-dim)" font-size="10" font-style="italic">failed 是设计内；faulted 是违约</text>
+    </svg>
+    <figcaption>状态机全图。崩溃只发生在 running；waiting 的恢复由调度器在 on 列表全部终态后自动触发。</figcaption>
+  </figure>
+
+  <h2 id="sec-phases">7.3 检查点纪律：阶段处理器怎么写</h2>
+  <p>一个阶段处理器的铁律（<code>src/types.ts:148-155</code> 的 <code>PhaseHandler</code> 文档注释）：</p>
+  <blockquote><p>It must commit a changed checkpoint or a terminal outcome through <code>runtime.commit()</code>; returning without durable progress faults the task.</p></blockquote>
+  <p>也就是说，每个阶段的结尾只有两条合法出路：</p>
+  <pre><code>charge: async (task, runtime, context) =&gt; {
+	const txId = await chargeCard(task.input.card, context);      // 外部副作用
+	await runtime.commit(async (tx, current) =&gt; {
+		// 出路一：提交新检查点（返回 NextTaskState，同一提交里替换任务状态）
+		return { status: "running", checkpoint: { phase: "capture", txId } };
+	}, context);
+},
+capture: async (task, runtime, context) =&gt; {
+	const receiptId = await capture(task.state.checkpoint.txId, context);
+	await runtime.commit(async (tx) =&gt; {
+		// 出路二：提交终局
+		return { status: "terminal", outcome: { status: "completed", result: { receiptId } } };
+	}, context);
+},</code></pre>
+  <p>
+    关键顺序：<strong>先做外部副作用，再提交检查点</strong>。若反过来（先提交"已扣款"再扣），
+    崩溃会留下说了谎的检查点。若只做副作用不提交 —— 返回即 faulted，这是运行时逼你诚实。
+    这就是 spec 5.2 节所称的 <em>effect sandwich</em>（效果三明治）：副作用夹在两个提交之间，
+    前一个提交声明"我要做了"（意图），后一个提交记录"做成了什么"。
+  </p>
+  <p>
+    <code>runtime</code> 还提供一套趁手工具（<code>src/types.ts:170-241</code>）：
+    <code>signal</code>（中止信号，长操作要观察它）、<code>memo(name, candidate)</code>
+    （首写胜出的持久便签 —— 生成任务用它存"这次请求 ID"，崩溃重跑不会重复生成）、
+    <code>sleep(until)</code>、<code>outcomes(ids)</code>（批量取终态）、
+    <code>conversation(id)</code>（拿受限句柄操纵子会话）、<code>report(error)</code>、
+    <code>hooks</code>（跑扩展钩子，第 9 章）。
+  </p>
+
+  <div class="demo" data-demo="taskDemo">
+    <div class="demo-title">动手试 — 检查点与崩溃续跑</div>
+    <p>
+      一个两阶段支付任务（charge → capture）。每点一次「推进调度」执行当前相位。
+      选「charge 后崩溃」模式：charge 提交检查点后进程死亡，再点推进即为重开后的调度 ——
+      注意它从哪个相位继续。
+    </p>
+    <label class="opt"><input type="radio" name="task-mode" value="normal" checked> 正常执行</label>
+    <label class="opt"><input type="radio" name="task-mode" value="crash"> charge 提交检查点后崩溃</label>
+    <br>
+    <button data-run>推进调度</button>
+    <div class="demo-output empty">点按钮开始。</div>
+  </div>
+
+  <h2 id="sec-waiting">7.4 等待子任务：waiting 与 completing</h2>
+  <p>README 的结账示例（<code>README.md:590-606</code>）展示了标准编排骨架：</p>
+  <pre><code>pay: async (task, runtime, context) =&gt; {
+	await runtime.commit(async (tx) =&gt; {
+		const payments = [];
+		for (const card of task.input.cards) {
+			payments.push(
+				await tx.createTask(Payment, { card },
+					{ ownership: { kind: "task", taskId: task.id } }),  // 子任务归我
+			);
+		}
+		// 全部完成后在 decide 相位恢复；第一个失败则中止其余
+		return {
+			status: "waiting",
+			checkpoint: { phase: "decide", payments },
+			on: payments,
+			policy: "failFast",
+		};
+	}, context);
+},
+decide: async (task, runtime, context) =&gt; {
+	const outcomes = await runtime.outcomes(task.state.checkpoint.payments, context);
+	// ...提交本任务自己的结局
+},</code></pre>
+  <ul>
+    <li><strong>waiting 期间不跑代码</strong>：进程可以死、可以关，恢复完全由存储状态驱动。<code>on</code> 里还可以放别人的任务（仅 allSettled 时）。</li>
+    <li><strong>两种 policy</strong>：<code>allSettled</code> 等全部终态；<code>failFast</code> 第一个失败即刻中止其余。</li>
+    <li><strong>completing 的意义</strong>：任务想结束（比如 aborted）时，它拥有的普通工作还在飞。结局先挂起（completing），等下属全部终态才转 terminal —— <code>waitForTask()</code> 这时才返回。failed/aborted 的结局会<strong>先中止</strong>下属再进入 completing，所以"中止自下而上"：每个任务先撤干净自己管的，再轮到自己的 abort 处理器收尾。</li>
+  </ul>
+
+  <h2 id="sec-options">7.5 TaskOptions：归属与两个逃生门</h2>
+  <pre><code>await tx.createTask(Payment, input, {
+	ownership: { kind: "conversation" },  // 必填：会话拥有（顶层）或 { kind: "task", taskId }（子任务）
+	conversationId: otherConversationId,  // 可选：归属别的会话（默认 tx 绑定的会话）
+	background: true,                     // 仅会话拥有：排除在普通空闲等待/会话中止/级联之外
+	abandonOnRestart: true,               // 创建者只在内存里等它：重启后直接按 restart 理由中止
+});</code></pre>
+  <ul>
+    <li><strong>background</strong> 是所有权边界：后台子树在父会话 Esc（abort）时幸存，也不拖住父的空闲判断；要连它一起停用 <code>abort(context, { background: true })</code>。</li>
+    <li><strong>abandonOnRestart</strong> 诚实面对"没人会回来等它"的任务：下个 Harness 开始调度时发现它还活着，先打上 <code>abortReason: "restart"</code> 的中止标记再谈别的。不可重放的工具（第 8 章）的嵌套调用与子任务自动获得这个待遇。</li>
+  </ul>
+
+  <h2 id="sec-subagents">7.6 子代理：任务拥有会话</h2>
+  <p>
+    所有权不止"任务拥有任务"—— <strong>会话也能被任务拥有</strong>
+    （<code>ConversationOwnership = { kind: "ownerless" } | { kind: "task", taskId }</code>，
+    <code>src/types.ts:300</code>）。这就是子代理模式的骨架（README 的示例，<code>README.md:547-573</code>）：
+  </p>
+  <pre><code>const subagent = defineTool({
+	name: "subagent",
+	parameters: Type.Object({ task: Type.String() }),
+	replay: "safe",                       // 崩溃重跑时找回同一个孩子，而不是再开一个
+	execute: async (args, api, context) =&gt; {
+		const child = await api.commit(async (tx) =&gt; {
+			// 所有权索引记住了孩子：重跑按 ownerTaskId 找回
+			const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
+			if (existing !== undefined) return existing.id;
+			const created = await tx.createConversation({
+				ownership: { kind: "task", taskId: api.taskId },  // 孩子归本调用
+			});
+			await configure(tx, created.id, { model: cheap, extensions: { remove: [Subagent] } });
+			return created.id;
+		}, context);
+		await api.details({ conversationId: child }, context);   // 让 UI 能挂到孩子上
+		const request = { type: "input", content: args.task,
+			requestId: `subagent:${api.taskId}` } as const;
+		const handle = await api.conversation(child, context);
+		const settled = await (await handle!.submit(request, context)).wait(context);
+		return { output: [{ type: "text", text: settled.status }] };
+	},
+});</code></pre>
+  <p>被任务拥有的会话服从三件事：调用中止/失败 → 孩子跟着中止；父空闲要等孩子空闲；<code>background: true</code> 的锚任务可以隔断这层父子（持久子代理的标准做法，见 <code>test/examples/23-subagent-background.ts</code>）。</p>
+
+  <h2 id="sec-graph">7.7 看见任务：taskGraph 与 inspect</h2>
+  <ul>
+    <li><code>harness.taskGraph(context)</code> / <code>watchTaskGraph(context)</code> — 全库活任务的一张图（每个节点带 owner 边、状态、是否 background/被标记中止、拥有的会话），任务面板与调试用。任务<strong>随创建它的提交出现、随使它 terminal 的提交消失</strong>。</li>
+    <li><code>harness.inspect(context)</code> — 只读快照，多一个 taskGraph 不给的信息：pending 任务是否因定义缺失而 <em>blocked</em>（missing_task / task_too_old / migration_failed）。</li>
+    <li>三个内置任务（<code>src/harness/registry.ts</code> 的 BUILTIN_TASKS）：<code>pi.generation</code>（generation.ts:118，v1）、<code>pi.tool</code>（tool.ts:120，v2）、<code>pi.compaction</code>（compaction.ts:112，v1）。</li>
+  </ul>
+
+  <h2 id="sec-recap">7.8 本章回顾</h2>
+  <ul>
+    <li>defineTask 四要素：initial 检查点、按 phase 分发的处理器、abort 协议、migrate 版本迁移。</li>
+    <li>五态 pending/running/waiting/completing/terminal；五结局 completed/failed/aborted/orphaned/faulted；failed≠faulted。</li>
+    <li>铁律：副作用后必须 runtime.commit 新检查点或终局，否则 faulted（effect sandwich）。</li>
+    <li>waiting = 零代码停车等 on 列表；failFast 第一个失败中止其余；completing 等下属排空；中止自下而上。</li>
+    <li>ownership 三形态：会话拥有（可 background）、任务拥有、任务拥有会话（子代理）。</li>
+    <li>taskGraph 看图，inspect 看 blocked；内置 pi.generation / pi.tool / pi.compaction。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>阶段处理器只做副作用不 commit —— 返回即 faulted，白干。</li>
+      <li>先 commit 检查点再做副作用 —— 崩溃后检查点说谎，重跑跳过未发生的副作用（或重复执行）。</li>
+      <li>把外部错误直接 throw 出去想要 failed —— throw 出去是 faulted；业务失败应当自己 commit failed 结局。</li>
+      <li>在 waiting 状态里幻想还有代码在跑 —— 没有；一切恢复靠调度器看存储。</li>
+      <li>改了任务检查点结构但不升 version / 不写 migrate —— 老任务 orphans/blocked，新代码接不上。</li>
+      <li>期待 abortTask 立即生效 —— 它先标记并自下而上停下属，等轮到该任务自己的 abort 处理器，才变 terminal。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="7">
+    <h2>第 7 章测试</h2>
+
+    <div class="q" data-id="7-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — faulted：返回而无持久进展是运行时契约违约。"
+         data-rationale="B 正确（PhaseHandler 注释原文）。A 是设计内的失败，需要任务自己提交；C/D 都不是自动发生的事。"
+         data-review="sec-phases">
+      <div class="prompt"><span class="qnum">Q1.</span> 一个阶段处理器调了外部 API 然后直接 return，没有 runtime.commit。任务结局是？</div>
+      <label class="opt"><input type="radio" name="q-7-1" value="a"> A. failed</label>
+      <label class="opt"><input type="radio" name="q-7-1" value="b"> B. faulted</label>
+      <label class="opt"><input type="radio" name="q-7-1" value="c"> C. completed，只是没结果</label>
+      <label class="opt"><input type="radio" name="q-7-1" value="d"> D. aborted</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-2" data-type="mcq" data-correct='["a"]'
+         data-answer="A — failed 是任务自己声明并提交的预期内业务失败；faulted 是运行时抓到的违约（未捕获异常或无进展）。"
+         data-rationale="A 正确。B 颠倒；C 把两者混为一谈；D 与错误分类无关。"
+         data-review="sec-states">
+      <div class="prompt"><span class="qnum">Q2.</span> failed 与 faulted 的区别？</div>
+      <label class="opt"><input type="radio" name="q-7-2" value="a"> A. failed 是任务代码主动提交的预期内业务失败；faulted 是未捕获异常或无持久进展被运行时判违约</label>
+      <label class="opt"><input type="radio" name="q-7-2" value="b"> B. failed 是系统错误，faulted 是业务错误</label>
+      <label class="opt"><input type="radio" name="q-7-2" value="c"> C. 两者等价，只是历史命名</label>
+      <label class="opt"><input type="radio" name="q-7-2" value="d"> D. faulted 可以重试，failed 不行</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C — waiting：带 on 与 policy，期间不运行任何代码，恢复靠调度器。"
+         data-rationale="C 正确（README Child Tasks 一节的标准形态）。A 没有这样的语义；B/D 与等待无关。"
+         data-review="sec-waiting">
+      <div class="prompt"><span class="qnum">Q3.</span> 任务提交 { status: "waiting", checkpoint, on: childIds, policy: "failFast" } 之后、on 全部终态之前，它在做什么？</div>
+      <label class="opt"><input type="radio" name="q-7-3" value="a"> A. 在后台线程轮询子任务</label>
+      <label class="opt"><input type="radio" name="q-7-3" value="b"> B. 每秒被调度器唤醒检查一次</label>
+      <label class="opt"><input type="radio" name="q-7-3" value="c"> C. 什么都不做 —— 不跑代码，进程可死可关，恢复全靠存储状态</label>
+      <label class="opt"><input type="radio" name="q-7-3" value="d"> D. 处于 completing，等下属排空</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-4" data-type="fill" data-accepted='["failfast"]'
+         data-answer="failFast"
+         data-rationale="failFast：第一个子任务失败即中止其余；allSettled 等全部终态。"
+         data-review="sec-waiting">
+      <div class="prompt"><span class="qnum">Q4.</span> 填空：等待策略中，「第一个子任务失败就中止其余子任务」的 policy 叫 <code>______</code>。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D — completing：结局已提交，但要等它拥有的普通工作全部终态才转 terminal。"
+         data-rationale="D 正确。A/B/C 与此状态无关；failed/aborted 的结局还会先级联中止下属。"
+         data-review="sec-waiting">
+      <div class="prompt"><span class="qnum">Q5.</span> 任务提交了 aborted 结局，但它启动的普通子任务还在跑。此刻任务状态是？</div>
+      <label class="opt"><input type="radio" name="q-7-5" value="a"> A. terminal</label>
+      <label class="opt"><input type="radio" name="q-7-5" value="b"> B. waiting</label>
+      <label class="opt"><input type="radio" name="q-7-5" value="c"> C. running</label>
+      <label class="opt"><input type="radio" name="q-7-5" value="d"> D. completing</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-6" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A、B、C。"
+         data-rationale="A/B/C 全是 background 的效果。D 错：要连后台一起停需要 abort(context, { background: true })。"
+         data-review="sec-options">
+      <div class="prompt"><span class="qnum">Q6.</span> 会话拥有的任务标记 background: true 的效果有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-7-6" value="a"> A. 不拖住会话的 waitForIdle</label>
+      <label class="opt"><input type="checkbox" name="q-7-6" value="b"> B. 普通的 conversation.abort() 不碰它</label>
+      <label class="opt"><input type="checkbox" name="q-7-6" value="c"> C. 不参与所有权级联中止</label>
+      <label class="opt"><input type="checkbox" name="q-7-6" value="d"> D. 它永远不会被任何方式中止</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-7" data-type="mcq" data-correct='["b"]'
+         data-answer="B — 重跑时经所有权索引（scanConversations ownerTaskId）找回既有孩子；requestId 保证消息不重发。"
+         data-rationale="B 正是 replay: safe + scanConversations({ ownerTaskId }) + requestId 三件套的意义。A 会增殖孩子；C/D 违背所有权语义。"
+         data-review="sec-subagents">
+      <div class="prompt"><span class="qnum">Q7.</span> 崩溃后重跑一个 replay: safe 的子代理工具调用，如何避免开出第二个孩子会话？</div>
+      <label class="opt"><input type="radio" name="q-7-7" value="a"> A. 靠内存缓存记住孩子 ID</label>
+      <label class="opt"><input type="radio" name="q-7-7" value="b"> B. 在 api.commit 里按 ownerTaskId 扫描既有会话，有就复用；requestId 再加一层去重</label>
+      <label class="opt"><input type="radio" name="q-7-7" value="c"> C. 每次随机生成孩子名字再查找</label>
+      <label class="opt"><input type="radio" name="q-7-7" value="d"> D. 做不到，必须接受重复子会话</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-8" data-type="mcq" data-correct='["a"]'
+         data-answer="A — 先做外部副作用、再提交检查点；崩溃最多重做本相位，且语义可控。"
+         data-rationale="A 正确（effect sandwich）。B 会在崩溃时留下说谎的检查点，重跑跳过未发生的副作用；C 让任务 faulted；D 是自杀式写法。"
+         data-review="sec-phases">
+      <div class="prompt"><span class="qnum">Q8.</span> charge 相位要刷用户的卡。正确的顺序是？</div>
+      <label class="opt"><input type="radio" name="q-7-8" value="a"> A. 调支付接口 → 成功后 runtime.commit 提交带 txId 的新检查点</label>
+      <label class="opt"><input type="radio" name="q-7-8" value="b"> B. 先 commit 检查点说已扣款，再调支付接口</label>
+      <label class="opt"><input type="radio" name="q-7-8" value="c"> C. 只调接口，检查点交给框架自动写</label>
+      <label class="opt"><input type="radio" name="q-7-8" value="d"> D. 两个都先做，谁先返回算谁</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-9" data-type="mcq" data-correct='["c"]'
+         data-answer="C — orphaned：注册表里没有能接它的定义。"
+         data-rationale="C 正确。D 的 faulted 是运行时违约；A/B 需要任务自己提交，一个死任务做不到。注意：标了 abandonOnRestart 且 reason 为 restart 的任务会等定义回来再走 abort 清理，而不是立刻 orphaned。"
+         data-review="sec-states">
+      <div class="prompt"><span class="qnum">Q9.</span> 重启后一个 pending 任务的扩展始终没有安装，它最终的结局多半是？</div>
+      <label class="opt"><input type="radio" name="q-7-9" value="a"> A. failed</label>
+      <label class="opt"><input type="radio" name="q-7-9" value="b"> B. aborted</label>
+      <label class="opt"><input type="radio" name="q-7-9" value="c"> C. orphaned</label>
+      <label class="opt"><input type="radio" name="q-7-9" value="d"> D. faulted</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B — abort 自下而上：先中止下属，下属全停后本任务的 abort 处理器才开始撤销自己的效果。"
+         data-rationale="B 正确（README：abort runs bottom-up）。A 顺序颠倒会让下属失去清理依赖；C/D 无此设计。"
+         data-review="sec-waiting">
+      <div class="prompt"><span class="qnum">Q10.</span> 为什么中止是「自下而上」的？</div>
+      <label class="opt"><input type="radio" name="q-7-10" value="a"> A. 性能更好</label>
+      <label class="opt"><input type="radio" name="q-7-10" value="b"> B. 每个任务先撤掉自己拥有的工作，等它们全停，自己的 abort 处理器再清理 —— 各自撤销各自的效果</label>
+      <label class="opt"><input type="radio" name="q-7-10" value="c"> C. 因为存储只支持这个顺序</label>
+      <label class="opt"><input type="radio" name="q-7-10" value="d"> D. 为了让 waitForTask 更早返回</label>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测试</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测试</button>
+  </form>
+
+  <p style="margin-top:2rem; color:var(--muted);">
+    下一章：<a href="08-tools-and-env.html"><strong>第 8 章 — 工具与执行环境</strong></a>。
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

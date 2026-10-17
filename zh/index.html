@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pi-durable 源码导读</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <span class="brand">◆ pi-durable 源码导读</span>
+  <span class="crumb">从零到读懂 packages/durable 的每一层 API</span>
+  <span class="spacer"></span>
+</div>
+
+<main class="toc">
+  <div class="toc-header">
+    <div class="logo">◆</div>
+    <h1>pi-durable 源码导读</h1>
+    <p class="subtitle">
+      一本为「对 pi 一无所知」的读者写的十讲。围绕本仓库的 <code>packages/durable</code>
+      （@earendil-works/pi-durable v1.3.0）逐层展开：它解决什么问题、commit / Entry / Document /
+      Task / Submission 这些概念到底是什么、四个存储后端怎么选、工具与扩展怎么写、
+      以及崩溃后凭什么能续跑。所有结论都引用真实源码路径与行号，另有三个可交互演示。
+    </p>
+  </div>
+
+  <div class="dashboard">
+    <div class="progress-label">
+      <span>你的进度</span>
+      <span><strong id="progress-passed">0 / 10</strong> 章 · <strong id="progress-pct">0%</strong></span>
+    </div>
+    <div class="progress-bar"><div id="overall-progress" style="width:0%"></div></div>
+    <p class="small" style="margin-top:.7rem; margin-bottom:0;">
+      进度保存在浏览器 <code>localStorage</code>，刷新不丢。每章末尾有小测；
+      <strong>≥ 80% 即「学够了，可以往下走」</strong>（软门槛，不锁内容）。
+    </p>
+  </div>
+
+  <div class="chapter-grid"></div>
+
+  <p class="toc-footer small">
+    配套阅读：<code>packages/durable/README.md</code> ·
+    规范 <code>packages/durable/docs/spec.md</code> · 示例 <code>packages/durable/test/examples/</code>
+  </p>
+</main>
+
+<script>
+window.BOOK_CONFIG = {
+  slug: "pi-durable",
+  lang: "zh",
+  chapters: [
+    { n: 1, slug: "01-what-and-why" },
+    { n: 2, slug: "02-core-concepts" },
+    { n: 3, slug: "03-quick-start" },
+    { n: 4, slug: "04-storage-and-resume" },
+    { n: 5, slug: "05-api-panorama" },
+    { n: 6, slug: "06-commit-and-documents" },
+    { n: 7, slug: "07-tasks" },
+    { n: 8, slug: "08-tools-and-env" },
+    { n: 9, slug: "09-extensions-and-agent" },
+    { n: 10, slug: "10-inbox-watch-errors" }
+  ]
+};
+window.CHAPTER_DESCS = {
+  1: { title: "认识 pi-durable：它解决什么问题", desc: "pi 仓库全景、长时智能体的崩溃困境、先提交后展示的三个设计决定。" },
+  2: { title: "核心概念词汇表", desc: "Harness / Conversation / Entry / Commit / Document / Task / Submission 一次讲透 —— commit 到底是什么。" },
+  3: { title: "第一个程序：Quick Start 逐行精读", desc: "open → root → submit → wait → commit → close，每个调用在存储里留下什么。" },
+  4: { title: "持久化与恢复", desc: "四种存储后端取舍、重开对账、resume、requestId 幂等、provider 身份与缓存亲和。" },
+  5: { title: "Harness 与 Conversation：API 全景", desc: "两个核心接口的全部方法分组地图，HarnessOptions 六旋钮与动态配置。" },
+  6: { title: "Commit 深挖：Tx 与 Document", desc: "四个提交入口、Tx 全表面、三条事务规则、defineDoc 三维度与四种读法。含原子性演示。" },
+  7: { title: "Task：持久状态机与所有权", desc: "检查点纪律、五态五结局、等待与子任务、自下而上中止、子代理模式。含崩溃续跑演示。" },
+  8: { title: "工具与执行环境", desc: "defineTool、结果三通道、replay 策略、callers/deferred、嵌套调用 key 重挂、ExecutionEnv。" },
+  9: { title: "扩展、注册表与 Agent 配置", desc: "扩展五件套、热重载边界、系统提示词与缓存、configure 三形式、三类 hooks。" },
+  10: { title: "提交队列、观看、压缩与错误模型", desc: "inbox 与 whenBusy、三种观察方式、压缩阈值、错误三规则。含排队落点演示。" }
+};
+</script>
+<script src="assets/book.js" defer></script>
+</body>
+</html>

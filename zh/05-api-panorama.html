@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 5 章 — Harness 与 Conversation：API 全景</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ pi-durable 源码导读</a>
+  <span class="crumb">第 5 章 · API 全景</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="5">
+<script>window.BOOK_CONFIG = { slug: "pi-durable", lang: "zh", chapters: [{n:1,slug:"01-what-and-why"},{n:2,slug:"02-core-concepts"},{n:3,slug:"03-quick-start"},{n:4,slug:"04-storage-and-resume"},{n:5,slug:"05-api-panorama"},{n:6,slug:"06-commit-and-documents"},{n:7,slug:"07-tasks"},{n:8,slug:"08-tools-and-env"},{n:9,slug:"09-extensions-and-agent"},{n:10,slug:"10-inbox-watch-errors"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 5 章 · API 地图</div>
+    <h1>Harness 与 Conversation：API 全景</h1>
+    <p class="lede">
+      前四章你已经用过零星几个方法。本章把两个核心接口的<strong>全部</strong>方法摆到一张地图上，
+      按用途分组、注明定义位置，让你以后读任何 pi-durable 代码都能对号入座。
+      这是地图章，不是深潜章 —— commit、task、watch 各自的深处留给后面几章。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能按"生命周期 / 会话管理 / 任务 / 提交 / 观察与计量"五组说出 Harness 的方法</li>
+      <li>能说出 Conversation 的 13 个方法各自的用途</li>
+      <li>能背出 HarnessOptions 的六个字段及 models/settings 支持函数形式的意义</li>
+      <li>能区分 Conversation（完整句柄）与 ConversationHandle（任务/工具拿到的受限句柄）</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-harness-api">5.1 Harness 接口：五组方法</h2>
+  <p>定义在 <code>src/harness/types.ts:714-756</code>，它还 <code>extends Session</code>（<code>src/types.ts:951</code>），所以 Session 的读写也都在。按用途分组：</p>
+  <ul>
+    <li><strong>生命周期</strong>：<code>resume()</code> 启用调度（幂等；关闭后抛错）；<code>close(context)</code>；<code>closed: Promise&lt;SessionEnd&gt;</code>（正常关闭或存储错误后落定，用于监听故障重启）；<code>report(error)</code> 转发非致命错误。</li>
+    <li><strong>会话管理</strong>：<code>root(context, opts?)</code> 取/建根会话；<code>conversation(id, context)</code> 按 ID 取；<code>createConversation({ ownership, agent?, init? }, context)</code> 建独立会话。</li>
+    <li><strong>任务</strong>：<code>getTask(id)</code> 读任务记录；<code>waitForTask(id)</code> 等终态回执；<code>abortTask(id)</code> 打中止标记（返回 marked / terminal）；<code>taskGraph(context)</code> 与 <code>watchTaskGraph(context)</code> 看全库任务图；<code>inspect(context)</code> 活任务与未落定提交的只读快照（不跑任何代码）。</li>
+    <li><strong>提交</strong>：<code>submission(id, context)</code> 重新拿回；<code>abortSubmission(id, context, conversationId?)</code> 撤回（返回 aborted / already_placed / settled / not_found）。</li>
+    <li><strong>等待与计量</strong>：<code>waitForIdle(context)</code> 等所有无主会话空闲；<code>usage(context)</code> 全会话 <code>pi.usage</code> 之和。</li>
+  </ul>
+  <p>
+    从 Session 继承、同样常用的四个：<code>commit(cb, context)</code>（不绑定会话的裸提交线）、
+    <code>snapshot(token, ...)</code> / <code>documentState(...)</code> / <code>watchDoc(...)</code>
+    （读文档 / 订阅文档，第 6 章）、<code>subscribeCommits(listener)</code>（每个提交后同步回调，
+    写 UI 同步器时用）。
+  </p>
+
+  <h2 id="sec-conversation-api">5.2 Conversation 接口：13 个方法</h2>
+  <p>定义在 <code>src/harness/types.ts:653-709</code>，按你会在代码里用它的顺序排：</p>
+  <ul>
+    <li><code>id</code> — 会话 ID；句柄无状态，比较靠它。</li>
+    <li><code>agent(context)</code> — 解析后的智能体配置（模型、扩展、工具、sections、cwd），见第 9 章。</li>
+    <li><code>configure(change, context)</code> — 用一个 <code>AgentChange</code> 原子修改 <code>pi.agent</code>（换模型、加减扩展、改指令、换目录）。</li>
+    <li><code>submit(submission, context)</code> — 接纳输入或写入（第 10 章展开排队语义）。</li>
+    <li><code>reset(handoff?, context)</code> — 接纳一条 <code>pi.reset</code> 写入，另起新上下文，可带交接说明。</li>
+    <li><code>compact(instructions?, context)</code> — 安排手动压缩任务，返回 <code>TaskId&lt;CompactionResult&gt;</code>（第 10 章）。</li>
+    <li><code>commit(cb, context)</code> — 绑定此会话的提交（<code>tx.createTask()</code> 默认归属它），第 6 章。</li>
+    <li><code>context(context, { at? })</code> — 读<strong>激活上下文</strong>：head 标记、原始条目、各条目贡献的模型消息、拼好的下轮 messages。<code>at</code> 可看历史某点的上下文（fork 会从那里开始的样子）。</li>
+    <li><code>entries(query, limit, cursor, context)</code> — 翻<strong>分叉感知</strong>的会话历史（默认新在前）。</li>
+    <li><code>fork(at, options, context)</code> — 从某条可见条目分叉出独立会话。</li>
+    <li><code>abort(context, opts?)</code> — 撤回排队输入、中止其普通所有权范围内的活任务、等到空闲；<code>{ background: true }</code> 连后台工作一起。</li>
+    <li><code>waitForIdle(context)</code> — 等普通所有权范围没有存活的前台任务。</li>
+    <li><code>viewState(context)</code> / <code>watch(context)</code> — 结构化视图与逐帧观察（第 10 章）。</li>
+  </ul>
+
+  <h2 id="sec-options">5.3 HarnessOptions：六个旋钮</h2>
+  <pre><code>const harness = await Harness.open(storage, {
+	models,            // 必填：Models 对象，或 () =&gt; Models（每次使用时求值）
+	registry,          // 必填：RegistryReader（createRegistry() 的返回值）
+	settings,          // 可选：运行策略对象，或 () =&gt; settings（getter 实现动态配置）
+	env,               // 可选：(target, context) =&gt; ExecutionEnv，为每次工具调用/渲染建环境
+	conversationCreated, // 可选：每个建会话的 commit 里跑一次（给会话塞你的文档）
+	now,               // 可选：时钟注入（测试里固定时间）
+	onReport,          // 可选：接收不致命的错误（抛错的 hook、监听器等）
+}, context);</code></pre>
+  <p>两个值得强调的设计：</p>
+  <ul>
+    <li>
+      <strong><code>models</code> 和 <code>settings</code> 都接受函数</strong>
+      （<code>src/harness/types.ts:587-594</code>）：每次使用时重新求值。配合 getter，
+      可以做到改一个配置对象就全局生效，<strong>不用重开 Harness</strong>。README 的 Settings 一节给的范例就是
+      <code>get followUpMode() { return userSettings.followUpMode; }</code> —— 设置对象在跑动中变化，
+      下一次边界就按新值排。
+    </li>
+    <li>
+      <strong><code>conversationCreated</code> 是给每类会话注入你文档的钩子</strong>：
+      它在每个创建/分叉会话的 commit 里运行（包括工具裸调 <code>tx.createConversation()</code>），
+      你在这里 <code>tx.doc(YourDoc, record.id)</code>，保证任何途径诞生的会话都带上你的状态。
+    </li>
+  </ul>
+  <p><code>settings</code>（<code>HarnessSettings</code>，<code>types.ts:539-560</code>）里的字段先混个眼熟，用到再回查：<code>extensions</code>（默认扩展选择）、<code>stream</code>（请求参数）、<code>retry</code>、<code>compaction</code>（压缩阈值）、<code>progress</code>（进度提交节奏）、<code>toolExecution</code>（parallel/sequential）、<code>steeringMode</code>/<code>followUpMode</code>、<code>contextRetentionMs</code>/<code>documentRetentionMs</code>（内存驻留时长）。</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 820 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="API 地图">
+      <text x="410" y="24" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">API 地图：谁拿着什么</text>
+      <rect x="30" y="40" width="230" height="320" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="145" y="64" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">Harness</text>
+      <text x="48" y="90" style="fill:var(--fg-dim)" font-size="10">生命周期：resume / close / closed</text>
+      <text x="48" y="112" style="fill:var(--fg-dim)" font-size="10">会话：root / conversation /</text>
+      <text x="48" y="128" style="fill:var(--fg-dim)" font-size="10">  createConversation</text>
+      <text x="48" y="150" style="fill:var(--fg-dim)" font-size="10">任务：getTask / waitForTask /</text>
+      <text x="48" y="166" style="fill:var(--fg-dim)" font-size="10">  abortTask / taskGraph / inspect</text>
+      <text x="48" y="188" style="fill:var(--fg-dim)" font-size="10">提交：submission / abortSubmission</text>
+      <text x="48" y="210" style="fill:var(--fg-dim)" font-size="10">等待/计量：waitForIdle / usage</text>
+      <text x="48" y="232" style="fill:var(--fg-dim)" font-size="10">Session 继承：commit / snapshot /</text>
+      <text x="48" y="248" style="fill:var(--fg-dim)" font-size="10">  watchDoc / subscribeCommits …</text>
+      <text x="48" y="282" style="fill:var(--muted)" font-size="9" font-style="italic">src/harness/types.ts:714</text>
+      <rect x="300" y="40" width="230" height="320" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="415" y="64" text-anchor="middle" style="fill:var(--accent-2)" font-size="13" font-weight="700">Conversation</text>
+      <text x="318" y="90" style="fill:var(--fg-dim)" font-size="10">agent / configure — 跑什么</text>
+      <text x="318" y="112" style="fill:var(--fg-dim)" font-size="10">submit / reset / compact — 喂什么</text>
+      <text x="318" y="134" style="fill:var(--fg-dim)" font-size="10">commit — 原子写</text>
+      <text x="318" y="156" style="fill:var(--fg-dim)" font-size="10">context / entries — 读历史</text>
+      <text x="318" y="178" style="fill:var(--fg-dim)" font-size="10">fork — 分叉</text>
+      <text x="318" y="200" style="fill:var(--fg-dim)" font-size="10">abort / waitForIdle — 停与等</text>
+      <text x="318" y="222" style="fill:var(--fg-dim)" font-size="10">viewState / watch — 看</text>
+      <text x="318" y="282" style="fill:var(--muted)" font-size="9" font-style="italic">src/harness/types.ts:653</text>
+      <rect x="570" y="40" width="220" height="150" rx="10" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="680" y="64" text-anchor="middle" style="fill:var(--warn)" font-size="13" font-weight="700">ConversationHandle</text>
+      <text x="588" y="90" style="fill:var(--fg-dim)" font-size="10">任务与工具拿到的受限句柄：</text>
+      <text x="588" y="112" style="fill:var(--fg-dim)" font-size="10">submit / abort / waitForIdle</text>
+      <text x="588" y="140" style="fill:var(--fg-dim)" font-size="10">调用期结束（或 Harness 关闭）</text>
+      <text x="588" y="156" style="fill:var(--fg-dim)" font-size="10">后一切操作拒绝；已接纳的仍持久</text>
+      <text x="680" y="180" style="fill:var(--muted)" font-size="9" font-style="italic">types.ts:127</text>
+      <rect x="570" y="210" width="220" height="150" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="680" y="234" text-anchor="middle" style="fill:var(--pass)" font-size="13" font-weight="700">HarnessOptions</text>
+      <text x="588" y="260" style="fill:var(--fg-dim)" font-size="10">models* / registry* / settings /</text>
+      <text x="588" y="282" style="fill:var(--fg-dim)" font-size="10">env / conversationCreated /</text>
+      <text x="588" y="304" style="fill:var(--fg-dim)" font-size="10">now / onReport</text>
+      <text x="588" y="330" style="fill:var(--fg-dim)" font-size="10">models、settings 可为函数</text>
+      <text x="680" y="352" style="fill:var(--muted)" font-size="9" font-style="italic">types.ts:586</text>
+    </svg>
+    <figcaption>三张面孔：宿主拿完整 Conversation；任务/工具内部拿受限的 ConversationHandle；一切都是用 HarnessOptions 装配出来的。</figcaption>
+  </figure>
+
+  <h2 id="sec-handle">5.4 ConversationHandle：任务与工具眼中的会话</h2>
+  <p>
+    在工具或任务的 <code>execute()</code> 里，你通过 <code>api.conversation(id, context)</code>
+    拿到的是 <code>ConversationHandle</code>（<code>src/harness/types.ts:127-134</code>）而不是完整的
+    Conversation —— 只有 <code>submit</code>、<code>abort</code>、<code>waitForIdle</code> 三个操作。
+    这是刻意的：<strong>句柄绑定到当前调用（invocation）</strong>，调用结束（工具返回、任务中止、
+    Harness 关闭）后它的所有操作都会拒绝 —— 但已经接纳的提交仍然是持久的，不会跟着消失。
+    第 7 章的子代理示例会用到它。
+  </p>
+
+  <h2 id="sec-recap">5.5 本章回顾</h2>
+  <ul>
+    <li>Harness 五组：生命周期 / 会话 / 任务 / 提交 / 等待与计量，外加 Session 继承的读写。</li>
+    <li>Conversation 13 法：配置、喂入、原子写、读史、分叉、停等、观察。</li>
+    <li>HarnessOptions 六旋钮；models/settings 可传函数实现免重开的动态配置。</li>
+    <li>conversationCreated 保证任何途径新建的会话都带你的文档。</li>
+    <li>工具/任务内部拿的是受限的 ConversationHandle，随调用结束失效。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>把 <code>conversation.context()</code> 与 <code>CONTEXT</code>（取消令牌）混淆 —— 前者是读模型上下文的方法，后者是每个调用的最后一个参数。</li>
+      <li>关闭后再 <code>resume()</code> —— 抛错；resume 只在存活期内幂等。</li>
+      <li>在宿主代码里寻找完整的 ConversationHandle 行为 —— 它故意只有三个方法，别指望 configure。</li>
+      <li>忽略 <code>closed</code> promise —— 生产服务应监听它实现故障后重开（第 10 章错误模型）。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="5">
+    <h2>第 5 章测试</h2>
+
+    <div class="q" data-id="5-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C — inspect()：只读快照，不跑任何任务代码。"
+         data-rationale="C 正确：inspect 写入 nothing、运行 no task code。A 会启动调度；B 返回的是压缩任务 ID；D 返回的是任务图状态，也不是 inspect。"
+         data-review="sec-harness-api">
+      <div class="prompt"><span class="qnum">Q1.</span> 线上排障想看"现在有哪些活任务和未落定提交"，且绝不能触发执行，该用？</div>
+      <label class="opt"><input type="radio" name="q-5-1" value="a"> A. <code>harness.resume()</code> 后看日志</label>
+      <label class="opt"><input type="radio" name="q-5-1" value="b"> B. <code>conversation.compact()</code></label>
+      <label class="opt"><input type="radio" name="q-5-1" value="c"> C. <code>harness.inspect()</code></label>
+      <label class="opt"><input type="radio" name="q-5-1" value="d"> D. <code>harness.taskGraph()</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-2" data-type="fill" data-accepted='["configure","conversation.configure"]'
+         data-answer="configure()"
+         data-rationale="configure(change) 在一个 commit 里改 pi.agent：换模型、加减扩展、改指令、换 cwd。"
+         data-review="sec-conversation-api">
+      <div class="prompt"><span class="qnum">Q2.</span> 填空：给一个正在运行的会话换模型/扩展/工作目录，用 <code>conversation.______()</code>。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-3" data-type="mcq" data-correct='["b"]'
+         data-answer="B — 每次使用时重新调用函数取当前值，改配置对象即可生效，不必重开 Harness。"
+         data-rationale="B 正确（types.ts:587-594 的注释：called at each use）。A/C/D 都与函数形式的语义不符。"
+         data-review="sec-options">
+      <div class="prompt"><span class="qnum">Q3.</span> 把 <code>settings</code> 写成带 getter 的对象传给 Harness，效果是？</div>
+      <label class="opt"><input type="radio" name="q-5-3" value="a"> A. 打开时读一次，之后固定不变</label>
+      <label class="opt"><input type="radio" name="q-5-3" value="b"> B. 每次使用时重新求值，配置变化在下一次使用生效，无需重开</label>
+      <label class="opt"><input type="radio" name="q-5-3" value="c"> C. 需要调用 harness.reload() 生效</label>
+      <label class="opt"><input type="radio" name="q-5-3" value="d"> D. getter 会被忽略</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-4" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A、C、D。"
+         data-rationale="A/C/D 是三个仅有的操作。B 不在其中 —— 句柄是调用绑定的受限视图，configure 需要宿主侧的完整 Conversation。"
+         data-review="sec-handle">
+      <div class="prompt"><span class="qnum">Q4.</span> ConversationHandle 提供哪些操作？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-5-4" value="a"> A. submit</label>
+      <label class="opt"><input type="checkbox" name="q-5-4" value="b"> B. configure</label>
+      <label class="opt"><input type="checkbox" name="q-5-4" value="c"> C. abort</label>
+      <label class="opt"><input type="checkbox" name="q-5-4" value="d"> D. waitForIdle</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D — conversationCreated：每个创建或分叉会话的 commit 里都会跑，包括工具的裸 tx.createConversation()。"
+         data-rationale="D 正是它存在的意义（README：Your Own State 一节）。A 是建环境；B 是错误上报；C 与注入文档无关。"
+         data-review="sec-options">
+      <div class="prompt"><span class="qnum">Q5.</span> 想让任何途径（包括工具内部裸调 tx.createConversation）新建的会话都自动带上你的自定义文档，应该用？</div>
+      <label class="opt"><input type="radio" name="q-5-5" value="a"> A. <code>HarnessOptions.env</code></label>
+      <label class="opt"><input type="radio" name="q-5-5" value="b"> B. <code>HarnessOptions.onReport</code></label>
+      <label class="opt"><input type="radio" name="q-5-5" value="c"> C. 手动在每个 submit 前写文档</label>
+      <label class="opt"><input type="radio" name="q-5-5" value="d"> D. <code>HarnessOptions.conversationCreated</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-6" data-type="mcq" data-correct='["b"]'
+         data-answer="B — 不绑定会话的裸提交线（Session.commit）。"
+         data-rationale="B 正确：Harness.commit 不带会话上下文；Conversation.commit 的 tx.createTask 默认归属该会话。A 是读文档；C/D 是会话上的方法。"
+         data-review="sec-harness-api">
+      <div class="prompt"><span class="qnum">Q6.</span> <code>harness.commit(cb, context)</code>（Session 继承）与 <code>conversation.commit(cb, context)</code> 的关键区别？</div>
+      <label class="opt"><input type="radio" name="q-5-6" value="a"> A. 前者不支持文档写入</label>
+      <label class="opt"><input type="radio" name="q-5-6" value="b"> B. 后者绑定会话：其 tx.createTask 默认归属该会话；前者是裸提交线</label>
+      <label class="opt"><input type="radio" name="q-5-6" value="c"> C. 前者不落盘</label>
+      <label class="opt"><input type="radio" name="q-5-6" value="d"> D. 没有区别，完全等价</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-7" data-type="mcq" data-correct='["a"]'
+         data-answer="A — context({ at })：看 fork(at) 会从哪里开始的上下文，而不真正建会话。"
+         data-rationale="A 正确（types.ts:683-686 注释）。B 真的创建分叉；C/D 与 at 无关。"
+         data-review="sec-conversation-api">
+      <div class="prompt"><span class="qnum">Q7.</span> 想"预览"从某条历史条目分叉后会看到什么，但不真的创建会话，用？</div>
+      <label class="opt"><input type="radio" name="q-5-7" value="a"> A. <code>conversation.context(context, { at })</code></label>
+      <label class="opt"><input type="radio" name="q-5-7" value="b"> B. <code>conversation.fork(at, ...)</code></label>
+      <label class="opt"><input type="radio" name="q-5-7" value="c"> C. <code>conversation.entries(...)</code></label>
+      <label class="opt"><input type="radio" name="q-5-7" value="d"> D. <code>harness.inspect()</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C — closed：随 close() 或存储错误落定，reason 为 failed 时携带错误。"
+         data-rationale="C 正确（README 的 Errors 一节示例）。A 是同步方法；B 是仅订阅关闭瞬间；D 与故障监听无关。"
+         data-review="sec-harness-api">
+      <div class="prompt"><span class="qnum">Q8.</span> 生产服务想在 Harness 因存储错误倒下时自动重开，应该监听？</div>
+      <label class="opt"><input type="radio" name="q-5-8" value="a"> A. <code>harness.closed</code> 布尔字段</label>
+      <label class="opt"><input type="radio" name="q-5-8" value="b"> B. <code>subscribeClose</code> 里的返回值</label>
+      <label class="opt"><input type="radio" name="q-5-8" value="c"> C. <code>await harness.closed</code> 得到的 SessionEnd（reason=failed 时带 error）</label>
+      <label class="opt"><input type="radio" name="q-5-8" value="d"> D. <code>onReport</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测试</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测试</button>
+  </form>
+
+  <p style="margin-top:2rem; color:var(--muted);">
+    下一章：<a href="06-commit-and-documents.html"><strong>第 6 章 — Commit 深挖：Tx 事务面与 Document 文档系统</strong></a>。
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

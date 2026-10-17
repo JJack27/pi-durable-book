@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 8 章 — 工具与执行环境</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ pi-durable 源码导读</a>
+  <span class="crumb">第 8 章 · 工具与环境</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="8">
+<script>window.BOOK_CONFIG = { slug: "pi-durable", lang: "zh", chapters: [{n:1,slug:"01-what-and-why"},{n:2,slug:"02-core-concepts"},{n:3,slug:"03-quick-start"},{n:4,slug:"04-storage-and-resume"},{n:5,slug:"05-api-panorama"},{n:6,slug:"06-commit-and-documents"},{n:7,slug:"07-tasks"},{n:8,slug:"08-tools-and-env"},{n:9,slug:"09-extensions-and-agent"},{n:10,slug:"10-inbox-watch-errors"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 8 章 · 深潜之三</div>
+    <h1>工具（Tools）与执行环境（Env）</h1>
+    <p class="lede">
+      模型只能"说话"，改变世界靠工具。本章讲透：怎么定义一个工具、它的三通道结果、
+      崩溃后的重放（replay）策略、谁能调用谁（callers）、工具套工具的嵌套调用（executeTool）、
+      以及所有工具副作用都流经的 ExecutionEnv —— 内置 read / write / edit / bash 就是活教材。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能用 defineTool 写出带 TypeBox 参数与结构化输出的工具</li>
+      <li>能说清结果三通道 output / structuredOutput / details 各自给谁看</li>
+      <li>能判断一个工具该标 replay: safe 还是默认 unsafe，以及崩溃后各自发生什么</li>
+      <li>能用 callers / deferred / modelTools 控制模型与程序各自能看到、调用哪些工具</li>
+      <li>能用 api.executeTool() 写工具套工具，并解释嵌套调用的 key 重挂机制</li>
+      <li>能解释 ExecutionEnv 的作用与内置四个编码工具如何通过它接触世界</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-define-tool">8.1 defineTool：一个工具的全貌</h2>
+  <pre><code>import { Type } from "@earendil-works/pi-ai";
+import { defineTool } from "@earendil-works/pi-durable"; // src/harness/define.ts:13
+
+const lines = defineTool({
+	name: "lines",
+	description: "统计一个文件的行数",
+	parameters: Type.Object({ path: Type.String() }),       // TypeBox schema
+	structuredOutputSchema: Type.Object({ lines: Type.Number() }), // 可选：程序侧契约
+	replay: "safe",                    // 可选：崩溃中断后允许重跑（默认 "unsafe"）
+	// callers: ["model"],            // 可选：谁能调用，见 8.4
+	execute: async (args, api, context) =&gt; {     // args 类型由 parameters 推出
+		const text = await readText(api, args.path, context);
+		const count = text.split("\n").length;
+		return {
+			output: [{ type: "text", text: `${count} lines` }],  // 给模型
+			structuredOutput: { lines: count },                  // 给程序，会被 schema 校验
+		};
+	},
+});
+registry.install(defineExtension({ name: "count", tools: [lines] }));</code></pre>
+  <p>要点（<code>src/harness/types.ts:294-334</code> 的 <code>ToolRegistration</code>）：</p>
+  <ul>
+    <li><strong>参数先验证再执行</strong>：Harness 在调 <code>execute()</code> 之前用 schema 验证模型给的参数。<code>prepareArguments</code> 可在验证前修补模型的常见错误（比如把数组写成了 JSON 字符串），且必须是纯函数。</li>
+    <li><strong>声明了 structuredOutputSchema 就必须给结构化输出</strong>（错误结果可豁免），Harness 负责校验；没声明却给了会怎样？—— 不允许，没有 schema 的工具程序侧直接拿它的 bounded output。</li>
+    <li><strong>流式输出</strong>：<code>api.output(chunk)</code> 边跑边写运行输出，UI 在 <code>pi.live</code> 里实时看到；<code>execute()</code> 返回时若省略 <code>output</code>，累计的运行输出就是给模型的输出。长输出用 <code>api.retainedOutput()</code> 拿"保留的尾部"；<code>outputLimits</code> 控制字节/行数上限与保留头还是尾。</li>
+    <li><strong>execute 抛异常</strong> → 模型收到一条错误结果（工具任务本身 failed，但 run 不因此终止）。</li>
+  </ul>
+
+  <h2 id="sec-result-channels">8.2 结果三通道：一份结果，三种读者</h2>
+  <figure class="diagram">
+    <svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="三通道">
+      <text x="410" y="26" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">ToolExecutionResult 的三个通道</text>
+      <rect x="150" y="50" width="200" height="60" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="250" y="75" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">output</text>
+      <text x="250" y="95" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">给模型：进入转录（pi.tool-result）</text>
+      <rect x="470" y="50" width="200" height="60" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="570" y="75" text-anchor="middle" style="fill:var(--accent-2)" font-size="13" font-weight="700">structuredOutput</text>
+      <text x="570" y="95" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">给程序：executeTool 调用方 / 脚本</text>
+      <rect x="310" y="140" width="200" height="60" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="410" y="165" text-anchor="middle" style="fill:var(--pass)" font-size="13" font-weight="700">details</text>
+      <text x="410" y="185" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">给 UI：结构化展示（如 diff 摘要）</text>
+      <line x1="250" y1="110" x2="250" y2="135" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="130" y="222" style="fill:var(--muted)" font-size="10">转录里只存 output 与 details；</text>
+      <text x="130" y="238" style="fill:var(--muted)" font-size="10">structuredOutput 活在调用方任务文档里</text>
+    </svg>
+    <figcaption>一次工具结果的三种读者。给模型的走转录；给程序的走嵌套调用返回值；给界面的走 details —— 互不污染。</figcaption>
+  </figure>
+  <p>补充两条：结果可带 <code>usage</code>（工具自己调模型的耗费，计入 pi.usage.tools）；可带 <code>control</code> —— <code>{ terminate: true }</code>（当轮所有结果都要求时提前结束 run，不再多问一次模型）、<code>{ handoff: "..." }</code>（重置并交接，等价于工具版 reset）、<code>{ addTools: [...] }</code>（加载延迟工具，见 8.4）。<code>api.diagnostic()</code> 记录模型可见的备注（截断、溢出路径等），<code>bash</code> 的结构化输出是 <code>{ output, truncated, fullOutputPath?, exitCode }</code>，非零退出码会给错误结果但值仍携带。</p>
+
+  <h2 id="sec-replay">8.3 replay：崩溃之后，工具要不要再跑一遍</h2>
+  <p>工具调用的<strong>意图先于执行被提交</strong>（又是三明治）。进程死在 execute 中间时：</p>
+  <ul>
+    <li><strong>默认（unsafe）</strong>：不重跑。模型收到一条 <code>interrupted</code> 错误结果，附已提交的部分输出。理由：你没法证明副作用没做，重跑可能双花。</li>
+    <li><strong><code>replay: "safe"</code></strong>：重跑整个 execute。适用于可证明幂等的工具（纯读、带外部去重键的写）。重放安全是<strong>你的声明</strong>，框架只负责据此调度。</li>
+  </ul>
+  <p>推论：不可重放工具的嵌套调用与它建的子任务自动 <code>abandonOnRestart</code>（第 7 章）—— 反正没人会回来等它们。反之，replay-safe 的工具重跑时，它之前的嵌套调用按 key <strong>重新挂接</strong>而非重发（8.5）。</p>
+
+  <h2 id="sec-callers">8.4 callers / deferred / modelTools：谁能看到谁</h2>
+  <ul>
+    <li><strong><code>callers</code></strong>（<code>types.ts:318-323</code>）：谁可调用 —— <code>["model"]</code>（仅模型，如 codemode，防脚本启动脚本）、<code>["tools"]</code>（仅其他工具经 executeTool，如藏在代码模式后面的 MCP 工具，模型永远看不到）、默认两者皆可。</li>
+    <li><strong><code>deferred: true</code></strong>：先不给模型，直到被加载。配 <code>@earendil-works/pi-durable/tool-search</code> 的 <code>createToolSearchExtension()</code>：模型用 <code>tool_search</code> 搜到后经 <code>control.addTools</code> 加载，记录进 modelTools。大工具集（整个 MCP 服务器）的标准做法。</li>
+    <li><strong><code>modelTools</code></strong>（会话配置，第 9 章）：在已启用的工具里缩窄"提供给模型"的名单，但不影响工具间互相调用。</li>
+  </ul>
+  <p><code>conversation.agent()</code> 的解析结果直接体现这套过滤：<code>tools</code>（给模型的）、<code>callable</code>（程序可调的）、<code>deferred</code>（可加载的）三个列表。</p>
+
+  <h2 id="sec-nested">8.5 嵌套调用：api.executeTool()</h2>
+  <p>工具里调工具，每次嵌套调用都是<strong>独立的 pi.tool 任务</strong>，归调用者所有：</p>
+  <pre><code>const testsPass = defineTool({
+	name: "tests_pass",
+	description: "跑测试并回答是否通过",
+	parameters: Type.Object({}),
+	execute: async (_args, api, context) =&gt; {
+		const run = await api.executeTool("bash", { command: "npm test" }, context, { progress: false });
+		// bash 声明了 schema：非零退出也有 structuredOutput
+		const exitCode = (run.structuredOutput as { exitCode: number } | undefined)?.exitCode;
+		return { output: [{ type: "text", text: exitCode === 0 ? "passed" : "failed" }] };
+	},
+});</code></pre>
+  <p>嵌套调用的规则几乎每条都有用（<code>types.ts:256-287</code> 的长注释）：</p>
+  <ul>
+    <li>调用方拿到 <code>taskId / structuredOutput / details / diagnostics / usage / isError</code> —— <strong>拿不到给模型的 output</strong>。被阻塞、无效、失败、中止的嵌套调用返回 isError 结果而不是 reject。</li>
+    <li><strong>key 重挂</strong>：每个嵌套调用有 key（默认是它在本次调用里的序号 1、2、…，也可显式传）。replay-safe 的调用者崩溃重跑时，按相同顺序（或相同 key）发出的调用会<strong>接回既有任务</strong>（已完成的拿结果，在跑的等它），不重复执行。注意被崩溃打断在结果提交前的那个嵌套调用，按它自己的 replay 策略处理 —— 所以这不是精确一次执行。</li>
+    <li><code>progress: false</code>：不为嵌套调用提交运行输出，只提交状态 —— 省写放大，代价是中断后结果里没有部分输出。</li>
+    <li>调用者返回前，它留下的仍在跑的嵌套调用会被中止；嵌套结果不长期保存（调用者结算后即清，任务记录里只留小回执）。</li>
+    <li>嵌套调用的 usage 已计在自己工具名下，结果里再转交会算两遍。</li>
+    <li>深度无上限，默认 callers 的工具甚至能递归调自己 —— 需要限制就用 callers。</li>
+  </ul>
+
+  <h2 id="sec-env">8.6 ExecutionEnv：工具触碰世界的唯一通道</h2>
+  <p>
+    工具不直接 <code>fs.readFile</code>、不直接 <code>child_process</code>。
+    一切文件与进程访问都走 <code>api.env</code> —— 一个由 <code>HarnessOptions.env</code>
+    <strong>按调用现建</strong>的执行环境对象。这个设计买来三样东西：
+  </p>
+  <ul>
+    <li><strong>沙箱可换</strong>：默认 <code>NodeExecutionEnv</code>（本机文件系统 + 无 shell 的 argv 执行）；你可以每会话一个容器、每会话一个远程目录 —— 只需一个函数（<code>src/env/index.ts</code> 的 <code>ExecutionEnv</code> 接口：读文件、读目录、exec、cleanup、可选 listFiles，<code>id</code> 用于按路径串行化写）。</li>
+    <li><strong>审查有钩子</strong>：beforeTool 钩子看到的是即将进环境的参数；env 抛错会成为该次调用的错误结果。</li>
+    <li><strong>宿主复用</strong>：宿主自己也能用 env 展示项目文件：<code>openBinaryReader()</code>（字节区间读）、<code>openDirReader()</code>（分页目录）、<code>exec(["git","status"], { onOutput }, context)</code>（argv 数组、无 shell、标注输出流）。</li>
+  </ul>
+  <pre><code>import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
+
+const harness = await Harness.open(storage, {
+	models, registry,
+	env: ({ cwd }) =&gt; new NodeExecutionEnv({ cwd: cwd ?? process.cwd() }),
+}, context);</code></pre>
+
+  <h2 id="sec-builtin">8.7 内置编码工具：read / write / edit / bash</h2>
+  <p><code>@earendil-works/pi-durable/tools</code> 提供（<code>src/tools/index.ts</code>）：</p>
+  <ul>
+    <li><code>createReadTool()</code> / <code>createWriteTool()</code> / <code>createEditTool()</code> / <code>createBashTool()</code> —— 单件工厂（bash 支持 <code>commandPrefix</code>，如自动激活 venv）；</li>
+    <li><code>createCodingTools(options)</code> —— 打包四件的扩展；<code>CodingTools</code> 是默认实例；</li>
+    <li>同名后装覆盖先装（扩展顺序决定胜负），<code>wrapTool</code> 装饰赢家（第 9 章）；</li>
+    <li><code>read</code> 读图片文件返回图像块：尺寸/大小限制按模型的 <code>inputLimits.images.resize</code>（默认 2000×2000、4.5MB base64）。装上 <code>createNodePhotonImages()</code>（<code>/images/node</code>，WebAssembly 的 Photon，工作线程里解码、30 秒闲置退出）后才会解码/旋转/缩放；不装则 PNG/JPEG/GIF/WebP 原样直传、超限拒绝。内存紧张的宿主（Cloudflare）别装。</li>
+  </ul>
+
+  <h2 id="sec-recap">8.8 本章回顾</h2>
+  <ul>
+    <li>defineTool：TypeBox 参数先验证后执行；三通道结果；流式 api.output；异常变错误结果。</li>
+    <li>replay：unsafe（默认，中断后模型拿 interrupted 错误）vs safe（声明幂等，重跑）。</li>
+    <li>callers 分模型/程序两侧；deferred + tool_search 按需加载；modelTools 缩窄模型视野。</li>
+    <li>executeTool：嵌套即子任务，key 重挂保证 replay-safe 调用者不重复副作用；程序拿 structuredOutput 不拿 output。</li>
+    <li>ExecutionEnv 是工具触碰世界的唯一通道，按调用现建、可沙箱可远程。</li>
+    <li>内置 read/write/edit/bash + CodingTools；图片处理按需装 Photon。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>给不安全的工具标 replay: safe —— 双花、重复发邮件都是这么来的；先有幂等证据再标。</li>
+      <li>声明了 structuredOutputSchema 却在错误路径上不给值 —— 程序侧拿到 invalid_structured_output 错误结果。</li>
+      <li>把嵌套调用的 usage 原样转交到自己的结果里 —— 计费翻倍。</li>
+      <li>以为 executeTool 拿到的 structuredOutput 永远存在 —— 无 schema 工具给的是 bounded output，Harness 自写的错误结果（blocked/invalid/interrupted/aborted）根本不带。</li>
+      <li>没配 HarnessOptions.env 就用内置工具 —— 工具以错误结果失败，这行报错是配置提示。</li>
+      <li>expecting 嵌套调用按 executionMode 排队 —— 嵌套调用立刻开跑，并发由你 await 什么决定。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="8">
+    <h2>第 8 章测试</h2>
+
+    <div class="q" data-id="8-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — output 给模型（进转录），structuredOutput 给程序，details 给 UI。"
+         data-rationale="B 正确。A 颠倒前两者；C 转录里存的恰是 output 与 details；D 无此规则。"
+         data-review="sec-result-channels">
+      <div class="prompt"><span class="qnum">Q1.</span> 工具结果三通道的分工是？</div>
+      <label class="opt"><input type="radio" name="q-8-1" value="a"> A. output 给程序，structuredOutput 给模型，details 给存储</label>
+      <label class="opt"><input type="radio" name="q-8-1" value="b"> B. output 给模型并进入转录；structuredOutput 给程序调用方；details 给 UI</label>
+      <label class="opt"><input type="radio" name="q-8-1" value="c"> C. 三者都进转录</label>
+      <label class="opt"><input type="radio" name="q-8-1" value="d"> D. details 给模型，output 给 UI</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-2" data-type="mcq" data-correct='["a"]'
+         data-answer="A — interrupted 错误结果，附已提交的部分输出；不重跑。"
+         data-rationale="A 正确：默认 replay unsafe 的语义。B 是 safe 的行为；C/D 都不发生 —— 意图已提交，调用不能凭空消失。"
+         data-review="sec-replay">
+      <div class="prompt"><span class="qnum">Q2.</span> 一个未标 replay 的 bash 工具调用执行到一半进程崩溃，重开后模型看到什么？</div>
+      <label class="opt"><input type="radio" name="q-8-2" value="a"> A. interrupted 错误结果，带崩溃前已提交的输出</label>
+      <label class="opt"><input type="radio" name="q-8-2" value="b"> B. 该调用从头重跑</label>
+      <label class="opt"><input type="radio" name="q-8-2" value="c"> C. 什么都没有，调用消失</label>
+      <label class="opt"><input type="radio" name="q-8-2" value="d"> D. 一条 completed 结果</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C — callers 设为仅 model：只有模型能调，脚本/工具不能。"
+         data-rationale="C 正确：codemode 就是这个配置，防止脚本启动脚本。A 与需求相反；B 是工具侧专属（模型看不到）；D 是默认。"
+         data-review="sec-callers">
+      <div class="prompt"><span class="qnum">Q3.</span> 希望 codemode 工具只能由模型直接调用、代码模式脚本不能再启动脚本，应配置？</div>
+      <label class="opt"><input type="radio" name="q-8-3" value="a"> A. callers: ["tools"]</label>
+      <label class="opt"><input type="radio" name="q-8-3" value="b"> B. callers: ["tools"] + deferred: true</label>
+      <label class="opt"><input type="radio" name="q-8-3" value="c"> C. callers: ["model"]</label>
+      <label class="opt"><input type="radio" name="q-8-3" value="d"> D. 什么都不配（默认）</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-4" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A/B/D 正确：独立 pi.tool 任务、结果回调用方、被阻塞调用返回 isError 结果。C 错：嵌套调用立刻开跑，不等调用者的 executionMode。"
+         data-review="sec-nested">
+      <div class="prompt"><span class="qnum">Q4.</span> 关于 api.executeTool() 的嵌套调用，正确的有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-8-4" value="a"> A. 每次嵌套调用是独立的 pi.tool 任务，归调用者所有</label>
+      <label class="opt"><input type="checkbox" name="q-8-4" value="b"> B. 结果返回给调用方程序，不进入转录</label>
+      <label class="opt"><input type="checkbox" name="q-8-4" value="c"> C. 按调用者的 executionMode 排队执行</label>
+      <label class="opt"><input type="checkbox" name="q-8-4" value="d"> D. 被阻塞或无效的嵌套调用返回 isError 结果</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B — 按 key（默认调用序号）接回既有嵌套任务：完成的直接拿结果，在跑的等它，不重发。"
+         data-rationale="B 正确（key 重挂机制）。A 会让副作用翻倍；C/D 与设计相悖 —— 且被打断在结果提交前的调用按它自己的 replay 策略走，所以并非精确一次。"
+         data-review="sec-nested">
+      <div class="prompt"><span class="qnum">Q5.</span> replay-safe 的工具崩溃重跑，它之前已经完成的嵌套调用会怎样？</div>
+      <label class="opt"><input type="radio" name="q-8-5" value="a"> A. 全部重新执行一遍</label>
+      <label class="opt"><input type="radio" name="q-8-5" value="b"> B. 按相同 key/顺序接回：已完成的直接拿回结果，不重发</label>
+      <label class="opt"><input type="radio" name="q-8-5" value="c"> C. 全部变为 interrupted</label>
+      <label class="opt"><input type="radio" name="q-8-5" value="d"> D. 嵌套调用被 abandonOnRestart 清空</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-6" data-type="fill" data-accepted='["env","executionenv","api.env"]'
+         data-answer="ExecutionEnv（经 api.env 访问）"
+         data-rationale="内置工具的一切文件与进程访问都流经 api.env —— 由 HarnessOptions.env 按调用构建。"
+         data-review="sec-env">
+      <div class="prompt"><span class="qnum">Q6.</span> 填空：内置 read/write/edit/bash 触碰文件与进程的唯一通道是 <code>______</code>。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-7" data-type="mcq" data-correct='["d"]'
+         data-answer="D — 不装图像处理器时，PNG/JPEG/GIF/WebP 在限额内原样直传，超限或其他格式拒绝。"
+         data-rationale="D 正确（README Tools 一节）。A/B 需要 Photon 处理器；C 错误 —— 尺寸只从文件头读取，不解码。"
+         data-review="sec-builtin">
+      <div class="prompt"><span class="qnum">Q7.</span> 不安装图像处理器时，read 工具对图片文件的行为是？</div>
+      <label class="opt"><input type="radio" name="q-8-7" value="a"> A. 解码并缩放到 2000×2000 内</label>
+      <label class="opt"><input type="radio" name="q-8-7" value="b"> B. 按 EXIF 旋转图片</label>
+      <label class="opt"><input type="radio" name="q-8-7" value="c"> C. 一律拒绝图片</label>
+      <label class="opt"><input type="radio" name="q-8-7" value="d"> D. 限额内的 PNG/JPEG/GIF/WebP 原样直传，超限或其他格式拒绝</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C — control.terminate：当轮所有结果都要求时，run 不再发起下一次模型请求而直接结束。"
+         data-rationale="C 正确。A 是加载延迟工具；B 是重置交接；D 不存在。"
+         data-review="sec-result-channels">
+      <div class="prompt"><span class="qnum">Q8.</span> 工具结果想表达「这轮够了，别再问模型了，直接结束 run」，用 control 的哪个字段？</div>
+      <label class="opt"><input type="radio" name="q-8-8" value="a"> A. addTools</label>
+      <label class="opt"><input type="radio" name="q-8-8" value="b"> B. handoff</label>
+      <label class="opt"><input type="radio" name="q-8-8" value="c"> C. terminate</label>
+      <label class="opt"><input type="radio" name="q-8-8" value="d"> D. stop</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-9" data-type="mcq" data-correct='["b"]'
+         data-answer="B — prepareArguments：验证前修补模型常犯的参数错误，必须纯函数且不改原 args。"
+         data-rationale="B 正确（ToolRegistration.prepareArguments）。A 在验证之后已晚；C/D 不是注册字段。"
+         data-review="sec-define-tool">
+      <div class="prompt"><span class="qnum">Q9.</span> 模型总把数组参数写成 JSON 字符串，最对口的修正位置是？</div>
+      <label class="opt"><input type="radio" name="q-8-9" value="a"> A. afterTool 钩子里改结果</label>
+      <label class="opt"><input type="radio" name="q-8-9" value="b"> B. 工具定义的 prepareArguments</label>
+      <label class="opt"><input type="radio" name="q-8-9" value="c"> C. execute 里手动 JSON.parse</label>
+      <label class="opt"><input type="radio" name="q-8-9" value="d"> D. outputLimits</label>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测试</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测试</button>
+  </form>
+
+  <p style="margin-top:2rem; color:var(--muted);">
+    下一章：<a href="09-extensions-and-agent.html"><strong>第 9 章 — 扩展、注册表与 Agent 配置</strong></a>。
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

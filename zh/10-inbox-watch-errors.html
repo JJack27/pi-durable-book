@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 10 章 — 提交队列、观看、压缩与错误模型</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ pi-durable 源码导读</a>
+  <span class="crumb">第 10 章 · 运行时行为</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="10">
+<script>window.BOOK_CONFIG = { slug: "pi-durable", lang: "zh", chapters: [{n:1,slug:"01-what-and-why"},{n:2,slug:"02-core-concepts"},{n:3,slug:"03-quick-start"},{n:4,slug:"04-storage-and-resume"},{n:5,slug:"05-api-panorama"},{n:6,slug:"06-commit-and-documents"},{n:7,slug:"07-tasks"},{n:8,slug:"08-tools-and-env"},{n:9,slug:"09-extensions-and-agent"},{n:10,slug:"10-inbox-watch-errors"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 10 章 · 终章</div>
+    <h1>提交队列、观看、压缩与错误模型</h1>
+    <p class="lede">
+      最后四块运行时行为：会话忙的时候新消息去哪（inbox 与三种 whenBusy）；
+      UI 怎么零遗漏地看（viewState / watch / watchEvents）；上下文太长怎么办（compaction 的手动与自动）；
+      以及出错时爆炸半径的精确规则。读完本章，你具备通读 spec.md 的全部前置知识。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能区分 steer / followUp / reject 三种 whenBusy 行为与纯 write 的特殊待遇</li>
+      <li>能按场景选 viewState / watch / watchEvents 三种观察方式</li>
+      <li>能配置自动压缩阈值（reserveTokens / keepRecentTokens / backgroundTokens）并解释溢出重试</li>
+      <li>能复述错误三规则，判断任一错误的爆炸半径</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-inbox">10.1 会话忙时：inbox 与三种 whenBusy</h2>
+  <p>会话在 run 进行中即「忙」。此刻提交一条 input，默认排队进 <code>pi.inbox</code>；你也可以改行为：</p>
+  <pre><code>await root.submit({ type: "input", content: "顺便跑下测试" }, context);                    // 默认：followUp
+await root.submit({ type: "input", content: "用 pnpm 别用 npm", whenBusy: "steer" }, context); // 插队转向
+await root.submit({ type: "input", content: "只在不忙时发", whenBusy: "reject" }, context);    // 抛 ConversationBusy
+await root.submit({ type: "write", entry: { kind: "app.note", data: {...} } }, context);      // 被动写入</code></pre>
+  <ul>
+    <li><strong>steer（转向）</strong>：排在当前工具轮<strong>之后</strong>，汇入正在跑的 run —— 模型下一轮就看见。</li>
+    <li><strong>followUp（追问，默认）</strong>：等 run 回答完再放置，开启下一个 run。</li>
+    <li><strong>reject</strong>：直接抛 <code>ConversationBusy</code>，什么都不写。</li>
+    <li><strong>write 的特殊待遇</strong>：只带 kind+data 的纯展示性写入<strong>立刻追加</strong>、永不排队 —— 它不影响模型所见，聊天界面发一条就显示一条。带 model/head/edits 的写入则按 steer 的规矩等边界。</li>
+    <li>排队的 input 可撤回：<code>submission.abort(context)</code>（已放置的返回 already_placed）。</li>
+    <li>settings 的 <code>steeringMode / followUpMode</code>（"all" | "one-at-a-time"）决定一个边界放一批还是放一条。</li>
+    <li>run 失败时，排队项留在 inbox，等下一次输入或排队写入按最旧优先放置。</li>
+  </ul>
+  <p>另一个实用细节：input 可以指定 <code>entry</code> 决定它在转录里长什么样（比如 <code>chat.mention</code> 带作者信息），模型看到的仍是 <code>content</code> 的用户消息 —— 自定义 kind 不得以 <code>pi.</code> 开头。</p>
+
+  <div class="demo" data-demo="inboxDemo">
+    <div class="demo-title">动手试 — 忙碌会话里的一条消息去哪了</div>
+    <p>一个 run 正在跑（模型轮 → 工具轮 → 回答）。选择提交模式后点按钮，看这条消息何时进入转录。</p>
+    <label class="opt"><input type="radio" name="inbox-mode" value="steer" checked> whenBusy: steer（转向）</label>
+    <label class="opt"><input type="radio" name="inbox-mode" value="followUp"> whenBusy: followUp（默认）</label>
+    <label class="opt"><input type="radio" name="inbox-mode" value="reject"> whenBusy: reject</label>
+    <label class="opt"><input type="radio" name="inbox-mode" value="write"> 纯 write（kind+data）</label>
+    <br>
+    <button data-run>提交</button>
+    <div class="demo-output empty">点按钮运行。</div>
+  </div>
+
+  <h2 id="sec-watch">10.2 观看会话：三种方式</h2>
+  <ul>
+    <li>
+      <strong><code>viewState()</code></strong> — 会话的结构化视图（<code>ConversationView</code>：
+      <code>conversation / entries / docs</code>，见 <code>src/harness/view.ts:19-27</code>）
+      包成可订阅的只读状态：<code>view.subscribe(render); ...; view.dispose()</code>。
+      本进程 UI 的默认选择。
+    </li>
+    <li>
+      <strong><code>watch()</code></strong> — 同一份视图的<strong>精确帧</strong>流：每次提交一帧，
+      带这一帧的 Chord 增量 ops —— 适合转发给远端客户端原样应用。慢消费者最多积压 100 帧，
+      之后合并成一帧整视图；晚加入/重连的客户端从当前视图开始，<strong>不重放历史</strong>。
+    </li>
+    <li>
+      <strong><code>watchEvents(harness, conversationId, context)</code></strong>（实验性）— 
+      面向习惯 coding-agent 事件流（message_start、tool_execution_start…）的消费者：
+      先给一个 snapshot，之后每个提交一批带增量的事件。<code>test/examples/19-json.ts</code> 有完整输出。
+    </li>
+  </ul>
+  <p>「实时感」的来源是进度提交节奏（settings.progress，默认各 100ms）：半截回答与工具输出至多每 100ms 提交一次 —— 崩溃至多丢这一窗。远端存储可调大间隔省写。</p>
+
+  <h2 id="sec-compaction">10.3 压缩：把旧上下文叠进一条摘要</h2>
+  <pre><code>// 手动：立即安排压缩任务（会话继续工作，摘要就绪后在下一个边界放置）
+const id = await root.compact("保留失败测试的名字", context);
+
+// 自动：settings.compaction
+compaction: {
+	enabled: true,            // 阈值/溢出压缩开关（手动 compact 永远可用）
+	reserveTokens: 16384,     // 高于 contextWindow - reserveTokens：下一次请求阻塞等压缩
+	keepRecentTokens: 20000,  // 摘要大致保留多长的近期原文
+	backgroundTokens: 32768,  // 距阻塞阈值还差这么多时：后台先行压缩（0 关闭）
+	modelOverrides: { "local/small-32k": { reserveTokens: 4096, ... } }, // 按模型覆盖
+}</code></pre>
+  <ul>
+    <li>摘要写入 <code>pi.compaction</code> 条目并立起新 head；老条目照例留在存储。</li>
+    <li><strong>溢出自救</strong>：提供商因上下文超长拒绝请求时，生成任务压缩后<strong>重试一次</strong>。</li>
+    <li>多个压缩在飞时，唯一生效的是<strong>切得最深</strong>的那个；被超越的按 stale 落定（unanswered，reason "stale"）。</li>
+    <li>阻塞阈值上的压缩失败 → 等它的生成也失败（unanswered，model_error，detail Compaction failed: ...）；没东西可压或被钩子拒绝则放行请求。</li>
+    <li><code>beforeCompact</code> 钩子可拒绝（decline）或自带摘要；运行中的压缩列在 <code>pi.live.compactions</code>，最近失败留在 <code>pi.live.compactionFailure</code>。</li>
+    <li><code>reset(handoff)</code> 是更狠的手段：不摘要，直接另起新上下文，可选留一句交接说明。工具侧等价物是 <code>control.handoff</code>。</li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 820 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="压缩窗口">
+      <text x="410" y="24" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">压缩前后：模型看到的上下文</text>
+      <rect x="40" y="45" width="740" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="80" y="68" style="fill:var(--fg-dim)" font-size="11">旧条目（user/assistant/tool…）</text>
+      <rect x="60" y="78" width="260" height="26" rx="5" style="fill:var(--surface);stroke:var(--muted)"/>
+      <text x="190" y="96" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">被摘要替换的旧上下文</text>
+      <rect x="340" y="78" width="200" height="26" rx="5" style="fill:var(--surface);stroke:var(--pass)"/>
+      <text x="440" y="96" text-anchor="middle" style="fill:var(--pass)" font-size="10">keepRecentTokens：近期原文保留</text>
+      <rect x="560" y="78" width="200" height="26" rx="5" style="fill:var(--surface);stroke:var(--warn)"/>
+      <text x="660" y="96" text-anchor="middle" style="fill:var(--warn)" font-size="10">reserveTokens：给答案留的空间</text>
+      <line x1="40" y1="125" x2="780" y2="125" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <polygon points="410,135 402,129 418,129" style="fill:var(--accent)"/>
+      <rect x="40" y="140" width="740" height="80" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <rect x="60" y="155" width="220" height="30" rx="5" style="fill:var(--surface);stroke:var(--accent)" stroke-width="2"/>
+      <text x="170" y="175" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-weight="700">pi.compaction（摘要，新 head）</text>
+      <rect x="300" y="155" width="200" height="30" rx="5" style="fill:var(--surface);stroke:var(--pass)"/>
+      <text x="400" y="175" text-anchor="middle" style="fill:var(--pass)" font-size="10">近期条目原样保留</text>
+      <text x="540" y="175" style="fill:var(--fg-dim)" font-size="10">← 模型下一轮从这里开始看</text>
+      <text x="410" y="210" text-anchor="middle" style="fill:var(--muted)" font-size="10" font-style="italic">被摘要的旧条目仍在存储 —— reset 与 compaction 都不删除历史</text>
+    </svg>
+    <figcaption>压缩只改变模型看到的窗口（head 移动 + 一条摘要），存储里的完整历史不受影响。</figcaption>
+  </figure>
+
+  <h2 id="sec-errors">10.4 错误模型：三条规则定爆炸半径</h2>
+  <p>README Errors 一节的原文骨架（<code>README.md:719-733</code>）：</p>
+  <ol>
+    <li>
+      <strong>存储错误终结 Harness。</strong>撞上它的那个调用带着原始错误 reject；此后一切调用与所有挂起的 wait 以 <code>SessionFailed</code>（cause 是那个错误）reject；watch 与事件流以 session_failed 结束；运行中任务收到中止信号；onReport 收到一次错误；Harness 自行关闭。<strong>不重试</strong>（瞬时错误应在你自定义存储里自己重试）。恢复 = 重开存储：提交是原子的，存储一致，同 requestId 能找回已接纳的提交。
+    </li>
+    <li>
+      <strong>无效读只废这次调用。</strong><code>StorageRequestError</code>：坏游标、未知会话、读了文档不保留的历史；被取消的读同理。豁免只覆盖读 —— <code>commit()</code> 或 <code>mintId()</code> 抛 StorageRequestError 照样按规则一处理。
+    </li>
+    <li>
+      <strong>你的代码只废自己的单元。</strong>任务相位抛错 → 该任务 faulted；工具抛错 → 错误结果；钩子抛错 → 上报后跳过（beforeTool 视为阻止）；commit 回调抛错 → 回滚该提交。监听器抛错被上报，其余照跑。唯一例外：宿主 RegistryReader 的 snapshot() 抛错 —— 调度器没法干活，等同存储错误处理。
+    </li>
+  </ol>
+  <p>故障重启的标准写法：</p>
+  <pre><code>harness.closed.then((end) =&gt; {
+	if (end.reason === "failed") reopen(end.error);  // 重开存储、resume、同 requestId 重试
+});</code></pre>
+
+  <h2 id="sec-usage">10.5 计费与收尾</h2>
+  <ul>
+    <li>每个会话在 <code>pi.usage</code> 按两个维度累计：<code>provider/model</code>（模型响应）与工具名（自带 usage 的工具结果）；失败与中止的尝试也算。</li>
+    <li><code>harness.usage(context)</code> 给全会话总和；视图里实时可看。</li>
+    <li>下一步去哪：规范 <code>packages/durable/docs/spec.md</code>（5300+ 行的 normative 文档，每章的概念在那都有编号小节）；示例 <code>test/examples/00-31</code>；变更记录 <code>CHANGELOG.md</code>。</li>
+  </ul>
+
+  <h2 id="sec-recap">10.6 本章回顾（也是全书回顾）</h2>
+  <ul>
+    <li>忙会话三选一：steer 插当前工具轮后、followUp 等下个 run、reject 抛 ConversationBusy；纯 write 立即追加不排队。</li>
+    <li>观察三件套：viewState（本机 UI）、watch（精确帧转发远端）、watchEvents（事件流风格）；进度默认 100ms 一提交。</li>
+    <li>压缩双通道：手动 compact 随时；自动三阈值（阻塞 reserve / 保留 keepRecent / 后台 background）+ modelOverrides；溢出压缩后重试一次；reset 是不摘要的另起炉灶。</li>
+    <li>错误三规则：存储错废 Harness（不重试，重开恢复）、无效读只废本次、你的代码只废自己单元。</li>
+    <li>全书主线一句话：一切先提交、后展示；任务带检查点；所有权树定级联 —— 这三条撑起了其余所有 API。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>期待 reject 的提交留下点什么 —— 它什么都不写，异常就是全部信息。</li>
+      <li>纯 write 带上了 model 字段还纳闷为什么不立刻显示 —— 带 model/head/edits 的写入要等边界，只有 kind+data 的纯展示写入立即追加。</li>
+      <li>给 32k 小模型配全局 16k reserve —— 没剩多少可用了；用 modelOverrides 按模型分档。</li>
+      <li>watch 客户端断线重连后等重放 —— 没有；从当前整视图开始。</li>
+      <li>存储报错后继续用旧 harness —— 已 SessionFailed，一切调用都拒绝；重开。</li>
+      <li>以为 onReport 里抛错能引起注意 —— 它自己的异常被丢弃（它是错误的最后一站）。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="10">
+    <h2>第 10 章测试</h2>
+
+    <div class="q" data-id="10-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — steer：排在当前工具轮之后，汇入正在进行的 run。"
+         data-rationale="B 正确。A 是默认 followUp 的行为；C 更晚；D 会抛 ConversationBusy。"
+         data-review="sec-inbox">
+      <div class="prompt"><span class="qnum">Q1.</span> 用户想在模型下一轮就看到自己的补充（不打断当前 run），该用？</div>
+      <label class="opt"><input type="radio" name="q-10-1" value="a"> A. 默认 followUp</label>
+      <label class="opt"><input type="radio" name="q-10-1" value="b"> B. whenBusy: steer</label>
+      <label class="opt"><input type="radio" name="q-10-1" value="c"> C. whenBusy: reject 后再提交</label>
+      <label class="opt"><input type="radio" name="q-10-1" value="d"> D. 等会话空闲</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C — 立即追加进转录，即使 run 进行中也不排队。"
+         data-rationale="C 正确：纯展示写入不影响模型所见，随发随显。A/B/D 都把它当成会排队的写入。"
+         data-review="sec-inbox">
+      <div class="prompt"><span class="qnum">Q2.</span> 忙碌会话里提交 { type: "write", entry: { kind: "chat.mention", data: {...} } }（只有 kind 和 data），发生什么？</div>
+      <label class="opt"><input type="radio" name="q-10-2" value="a"> A. 排进 inbox 等下个 run</label>
+      <label class="opt"><input type="radio" name="q-10-2" value="b"> B. 抛 ConversationBusy</label>
+      <label class="opt"><input type="radio" name="q-10-2" value="c"> C. 立即追加到转录，不排队</label>
+      <label class="opt"><input type="radio" name="q-10-2" value="d"> D. 被丢弃</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-3" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A、C、D。"
+         data-rationale="A/C/D 正确。B 错：晚加入/重连的观察者从当前视图开始，历史不重放。"
+         data-review="sec-watch">
+      <div class="prompt"><span class="qnum">Q3.</span> 关于观察会话，正确的有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-10-3" value="a"> A. viewState 适合本进程 UI 常驻订阅</label>
+      <label class="opt"><input type="checkbox" name="q-10-3" value="b"> B. watch 断线重连后会重放全部历史帧</label>
+      <label class="opt"><input type="checkbox" name="q-10-3" value="c"> C. watch 每次提交一帧、带增量 ops，适合转发给远端应用</label>
+      <label class="opt"><input type="checkbox" name="q-10-3" value="d"> D. 慢消费者积压超 100 帧后收到一帧合并的整视图</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-4" data-type="mcq" data-correct='["a"]'
+         data-answer="A — 高于 contextWindow - reserveTokens 时，下一次请求阻塞等待压缩完成。"
+         data-rationale="A 正确（CompactionPolicy 字段注释）。B 描述的是 backgroundTokens；C 描述 keepRecentTokens；D 没有这个机制。"
+         data-review="sec-compaction">
+      <div class="prompt"><span class="qnum">Q4.</span> reserveTokens 的语义是？</div>
+      <label class="opt"><input type="radio" name="q-10-4" value="a"> A. 上下文超过 contextWindow - reserveTokens 时，请求阻塞等压缩 —— 给答案留空间</label>
+      <label class="opt"><input type="radio" name="q-10-4" value="b"> B. 距阻塞阈值还差这么多时后台启动压缩</label>
+      <label class="opt"><input type="radio" name="q-10-4" value="c"> C. 摘要保留的近期原文长度</label>
+      <label class="opt"><input type="radio" name="q-10-4" value="d"> D. 摘要自身的最大 token 数</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B — 生成任务压缩后重试一次。"
+         data-rationale="B 正确（overflow 策略：compacts and retries once）。A/C/D 都不是既定策略。"
+         data-review="sec-compaction">
+      <div class="prompt"><span class="qnum">Q5.</span> 提供商因上下文超长拒绝了请求，自动发生什么？</div>
+      <label class="opt"><input type="radio" name="q-10-5" value="a"> A. 立即失败，输入 unanswered</label>
+      <label class="opt"><input type="radio" name="q-10-5" value="b"> B. 生成任务压缩后重试一次该请求</label>
+      <label class="opt"><input type="radio" name="q-10-5" value="c"> C. 静默丢弃最早的条目再试</label>
+      <label class="opt"><input type="radio" name="q-10-5" value="d"> D. 无限重试</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-6" data-type="mcq" data-correct='["c"]'
+         data-answer="C — 存储错误：Harness 终结，此后一切调用以 SessionFailed 拒绝。"
+         data-rationale="C 正确（规则一）。A 是读侧豁免；B 是单元级规则；D 不存在。"
+         data-review="sec-errors">
+      <div class="prompt"><span class="qnum">Q6.</span> 一次 <code>conversation.commit()</code> 期间存储抛了 IO 错误。爆炸半径？</div>
+      <label class="opt"><input type="radio" name="q-10-6" value="a"> A. 只废这次调用</label>
+      <label class="opt"><input type="radio" name="q-10-6" value="b"> B. 只废这个会话</label>
+      <label class="opt"><input type="radio" name="q-10-6" value="c"> C. 整个 Harness 终结：后续调用与挂起 wait 全部 SessionFailed，任务收到中止，watch 以 session_failed 结束</label>
+      <label class="opt"><input type="radio" name="q-10-6" value="d"> D. 自动重试三次</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-7" data-type="fill" data-accepted='["sessionfailed","session failed"]'
+         data-answer="SessionFailed"
+         data-rationale="存储错误后，Harness 上一切后续调用与挂起等待都以 SessionFailed 拒绝（cause 是原始错误）。"
+         data-review="sec-errors">
+      <div class="prompt"><span class="qnum">Q7.</span> 填空：存储错误终结 Harness 后，后续调用统一以 <code>______</code> 错误拒绝。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-8" data-type="mcq" data-correct='["b"]'
+         data-answer="B — 用 end.reason === failed 分支重开：重开存储、resume、同 requestId 重试提交。"
+         data-rationale="B 是 README 给出的标准故障重启模式。A/C/D 都遗漏了持久层恢复的关键。"
+         data-review="sec-errors">
+      <div class="prompt"><span class="qnum">Q8.</span> 监听 harness.closed 之后，reason 为 failed 时正确的恢复姿势是？</div>
+      <label class="opt"><input type="radio" name="q-10-8" value="a"> A. 对旧 harness 继续 submit 等它自愈</label>
+      <label class="opt"><input type="radio" name="q-10-8" value="b"> B. 重开存储建新 Harness、resume、用相同 requestId 重试提交</label>
+      <label class="opt"><input type="radio" name="q-10-8" value="c"> C. 丢弃存储文件从零开始</label>
+      <label class="opt"><input type="radio" name="q-10-8" value="d"> D. 什么都不用做，自动恢复</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-9" data-type="mcq" data-correct='["d"]'
+         data-answer="D — 两处：视图 docs 的 pi.usage（该会话）与 harness.usage()（全会话总和）。"
+         data-rationale="D 正确。A 只覆盖模型侧且不含工具；B 是任务回执；C 是配置文档。"
+         data-review="sec-usage">
+      <div class="prompt"><span class="qnum">Q9.</span> 想知道这个会话/整个存储花了多少钱，读哪里？</div>
+      <label class="opt"><input type="radio" name="q-10-9" value="a"> A. 只能看提供商控制台</label>
+      <label class="opt"><input type="radio" name="q-10-9" value="b"> B. TaskOutcome 的 result</label>
+      <label class="opt"><input type="radio" name="q-10-9" value="c"> C. pi.agent 文档</label>
+      <label class="opt"><input type="radio" name="q-10-9" value="d"> D. 会话视图的 docs pi.usage 与 harness.usage() 总和</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-10" data-type="mcq" data-correct='["a"]'
+         data-answer="A — 多个在飞的压缩，切得最深（保留最少）的那个生效，其余按 stale 落定。"
+         data-rationale="A 正确（README：the furthest cut stays in effect）。B/C/D 与之矛盾。"
+         data-review="sec-compaction">
+      <div class="prompt"><span class="qnum">Q10.</span> 两个压缩任务同时在飞、切点不同，最终谁生效？</div>
+      <label class="opt"><input type="radio" name="q-10-10" value="a"> A. 切得更深的那个；另一个放置时按 stale 落定</label>
+      <label class="opt"><input type="radio" name="q-10-10" value="b"> B. 先完成的那个</label>
+      <label class="opt"><input type="radio" name="q-10-10" value="c"> C. 两条都生效</label>
+      <label class="opt"><input type="radio" name="q-10-10" value="d"> D. 都作废</label>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测试</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测试</button>
+  </form>
+
+  <p style="margin-top:2rem; color:var(--muted);">
+    全书完。接下来建议通读 <code>packages/durable/docs/spec.md</code>（规范正文）并按顺序跑
+    <code>test/examples/</code> —— 你已经具备读懂它们的全部词汇。
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

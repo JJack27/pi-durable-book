@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 1 章 — 认识 pi-durable：它解决什么问题</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ pi-durable 源码导读</a>
+  <span class="crumb">第 1 章 · 为什么需要它</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="1">
+<script>window.BOOK_CONFIG = { slug: "pi-durable", lang: "zh", chapters: [{n:1,slug:"01-what-and-why"},{n:2,slug:"02-core-concepts"},{n:3,slug:"03-quick-start"},{n:4,slug:"04-storage-and-resume"},{n:5,slug:"05-api-panorama"},{n:6,slug:"06-commit-and-documents"},{n:7,slug:"07-tasks"},{n:8,slug:"08-tools-and-env"},{n:9,slug:"09-extensions-and-agent"},{n:10,slug:"10-inbox-watch-errors"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 1 章 · 动机</div>
+    <h1>认识 pi-durable：它解决什么问题</h1>
+    <p class="lede">
+      你不需要先懂 pi 的其他部分。这一章只回答三个问题：pi 是什么、
+      一个 AI 智能体（agent）在长时间运行时为什么会"崩坏"、pi-durable 用什么思路解决它。
+      读完你就知道这个包在整个系统里的位置，以及它为什么被设计成后面九章的样子。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能说出 pi 仓库里各包的大致分工，以及 pi-durable 在其中的位置</li>
+      <li>能用自己的话讲清"长时智能体 + 进程随时会死"这对矛盾，并给出一个具体翻车场景</li>
+      <li>能复述 pi-durable 的核心承诺：先提交、后展示（committed before shown），以及"一切修改都走原子提交"</li>
+      <li>能画出 pi-durable 的分层：宿主程序 → Harness → Session/Storage，以及它依赖的 pi-ai 与 chord</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-what-is-pi">1.1 pi 是什么</h2>
+  <p>
+    你正在看的仓库 <code>/Users/jack/Documents/pi</code> 是 <strong>pi</strong> —— 一个用 TypeScript
+    写的 AI 编程智能体（coding agent）及其配套设施的 monorepo。它不是一个单一的程序，而是一组
+    npm 包，各自负责一层：
+  </p>
+  <ul>
+    <li><code>@earendil-works/pi-ai</code>（<code>packages/ai</code>）— 模型访问层：统一各家大模型（OpenAI 等）的请求、流式返回、工具调用协议。</li>
+    <li><code>@earendil-works/pi-agent</code>（<code>packages/agent</code>）— 智能体循环的纯逻辑层。</li>
+    <li><code>@earendil-works/pi-tui</code>（<code>packages/tui</code>）— 终端界面库。</li>
+    <li><code>@earendil-works/pi-coding-agent</code>（<code>packages/coding-agent</code>）— 最终那个终端编程助手，把上面的层组装成产品。</li>
+    <li><code>@earendil-works/pi-durable</code>（<code>packages/durable</code>）— <strong>本书的主角</strong>。官方一句话介绍（见 <code>packages/durable/package.json</code>）：<em>"Durable conversation, task, and document runtime for Pi"</em> —— 面向 Pi 的、可持久化的会话 / 任务 / 文档运行时。</li>
+  </ul>
+  <p>
+    注意 README 顶部的标注：<strong>Experimental（实验性）</strong>，API 会在版本间无预警地变动。
+    本书的一切结论都以你本地这份源码为准（版本 1.3.0），引用时给出真实文件路径与行号，
+    例如 <code>packages/durable/src/harness/harness.ts:460</code>。
+  </p>
+
+  <h2 id="sec-problem">1.2 问题：智能体是"长任务"，而进程随时会死</h2>
+  <p>
+    一个编程智能体的一次工作循环通常长这样：用户发消息 → 调模型 → 模型要求执行工具
+    （读文件、跑 bash、改代码）→ 把工具结果喂回模型 → 可能再来几轮 → 最终回答。
+    这个循环可能跑几十分钟，中间夹杂网络请求、子进程、大文件读写。
+  </p>
+  <p>
+    <strong>具体翻车场景</strong>：假设模型刚决定执行 <code>bash: npm test</code>，测试要跑 8 分钟。
+    第 4 分钟时你的笔记本合盖了、SSH 断了、或者进程被 kill。重新打开后会发生什么？
+    在一个把会话放在内存里的朴素实现里：
+  </p>
+  <ul>
+    <li>模型的回复丢了 —— 它还没写进任何地方，用户要重新问一遍（模型费白花）。</li>
+    <li>更糟：如果你做过"边生成边写文件"的持久化，文件里可能有半条模型消息 —— 存储和真实进度对不上。</li>
+    <li>测试进程成了孤儿，重启后没人知道它跑没跑完、结果有没有被消费。</li>
+    <li>最糟：如果重启后重放整个对话，<code>npm test</code> 这种有副作用的操作会被<strong>再执行一次</strong>。</li>
+  </ul>
+  <p>
+    这类系统的术语叫 <strong>durable execution（持久化执行）</strong>：把"正在做什么"的每一步
+    都先写进可靠存储，进程死了也能从断点继续，而且不重复已完成的副作用。
+    pi-durable 就是给 Pi 系列提供这套能力的包。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="崩溃对比图">
+      <text x="410" y="24" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">朴素内存实现 vs pi-durable：进程在第 4 分钟崩溃</text>
+      <!-- 左：朴素 -->
+      <rect x="20" y="45" width="380" height="220" rx="10" style="fill:var(--surface-2);stroke:var(--fail)" stroke-width="2"/>
+      <text x="210" y="70" text-anchor="middle" style="fill:var(--fail)" font-size="13" font-weight="700">内存态（无持久化）</text>
+      <rect x="50" y="90" width="90" height="30" rx="5" style="fill:var(--surface);stroke:var(--muted)"/>
+      <text x="95" y="110" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">用户输入</text>
+      <rect x="160" y="90" width="90" height="30" rx="5" style="fill:var(--surface);stroke:var(--muted)"/>
+      <text x="205" y="110" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">模型回复</text>
+      <rect x="270" y="90" width="100" height="30" rx="5" style="fill:var(--surface);stroke:var(--warn)"/>
+      <text x="320" y="110" text-anchor="middle" style="fill:var(--warn)" font-size="11">bash 跑到一半</text>
+      <line x1="50" y1="140" x2="370" y2="140" style="stroke:var(--fail)" stroke-width="2" stroke-dasharray="6 4"/>
+      <text x="210" y="160" text-anchor="middle" style="fill:var(--fail)" font-size="12" font-weight="700">✕ 进程死亡 → 以上全部蒸发</text>
+      <text x="210" y="185" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">重启 = 从零开始，副作用可能重放</text>
+      <text x="210" y="240" text-anchor="middle" style="fill:var(--muted)" font-size="11">状态只活在进程里</text>
+      <!-- 右：durable -->
+      <rect x="420" y="45" width="380" height="220" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="610" y="70" text-anchor="middle" style="fill:var(--pass)" font-size="13" font-weight="700">pi-durable（先提交，后展示）</text>
+      <rect x="450" y="88" width="80" height="30" rx="5" style="fill:var(--surface);stroke:var(--pass)"/>
+      <text x="490" y="108" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">pi.user ✓</text>
+      <rect x="545" y="88" width="90" height="30" rx="5" style="fill:var(--surface);stroke:var(--pass)"/>
+      <text x="590" y="108" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">pi.assistant ✓</text>
+      <rect x="650" y="88" width="90" height="30" rx="5" style="fill:var(--surface);stroke:var(--warn)"/>
+      <text x="695" y="108" text-anchor="middle" style="fill:var(--warn)" font-size="10">tool 任务(运行中)</text>
+      <rect x="450" y="140" width="290" height="26" rx="5" style="fill:var(--surface);stroke:var(--accent)"/>
+      <text x="595" y="158" text-anchor="middle" style="fill:var(--accent)" font-size="11">存储（SQLite / JSONL）— 每步先落盘</text>
+      <text x="610" y="195" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">✕ 进程死亡 → 存储完好</text>
+      <text x="610" y="218" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">重开存储 → resume() → 从断点任务继续</text>
+      <text x="610" y="245" text-anchor="middle" style="fill:var(--muted)" font-size="11">崩溃只丢最后 100ms 的流式进度</text>
+    </svg>
+    <figcaption>同样的崩溃，两种命运。pi-durable 的承诺：会话、模型轮次、工具调用、你自己的状态，全部在展示给任何人之前先提交进存储。</figcaption>
+  </figure>
+
+  <h2 id="sec-idea">1.3 pi-durable 的三个核心设计决定</h2>
+  <p>
+    README 的第一段就是全部设计的浓缩（<code>packages/durable/README.md:5</code>）：
+  </p>
+  <blockquote>
+    <p>
+      Conversations, model turns, tool calls, and your own state are committed to storage
+      <strong>before anything is shown</strong>. If the process dies mid-turn, reopening the storage
+      picks the work up where it stopped.
+    </p>
+  </blockquote>
+  <p>拆成三个可检验的决定：</p>
+  <ul>
+    <li>
+      <strong>决定一：唯一写入口 —— 原子提交（commit）。</strong>
+      会话里的任何修改（追加一条消息、改一个文档、创建一个任务）都不能单独发生，
+      必须打包在一次 <code>commit()</code> 里，要么全部落盘、要么全部没有发生。
+      这是你在问题里提到的 <code>commit</code> —— 它不是 git 的 commit，而是这个包自己的一等概念，
+      第 2 章和第 6 章会专门拆开讲。
+    </li>
+    <li>
+      <strong>决定二：任务即状态机（task）。</strong>
+      每件耗时的事（调模型、执行一个工具、做一次摘要）都是一个 <em>任务</em>，
+      它在每一步之前把"下一步从哪继续"的检查点（checkpoint）写进存储。
+      进程重启后，调度器看到 pending 的任务，从上一个检查点继续，而不是从头重放。
+      每个任务都有唯一的所有者（owner）—— 它所在的会话，或另一个任务 —— 这让"中止"能像树一样级联。
+    </li>
+    <li>
+      <strong>决定三：UI 只读已提交状态。</strong>
+      界面看到的一切（流式回答的半截文本、工具输出）都是已提交的存储状态的投影，
+      通过订阅（watch）拿到。没有任何"只存在于内存里的显示状态"，
+      所以晚加入的观察者、崩溃后的重连，看到的都是一致的画面。
+    </li>
+  </ul>
+
+  <h2 id="sec-stack">1.4 分层：pi-durable 站在哪里</h2>
+  <p>
+    pi-durable 不自己连模型、也不自己发明 JSON 状态管理。它依赖两个邻居
+    （见 <code>packages/durable/package.json:145-152</code> 的 dependencies）：
+  </p>
+  <ul>
+    <li><code>@earendil-works/pi-ai</code> — 所有模型请求走它。pi-durable 不认识 OpenAI 或 Anthropic，它只拿着一个 <code>Models</code> 目录对象。</li>
+    <li><code>@earendil-works/chord</code> — 文档状态框架：类型化 JSON 文档、增量（delta）操作、可订阅状态、以及贯穿全库的 <code>Context</code>（取消令牌）。</li>
+  </ul>
+  <p>
+    另一个会出现的名字是 <strong>Chord <code>Context</code></strong>：pi-durable 里
+    <strong>每一个异步调用</strong>的最后一个参数都是它，它携带取消信号。
+    <code>BACKGROUND_CONTEXT</code> 是"永不取消"的那个。取消一个 <code>wait()</code> 只取消这次等待，
+    永远不会取消已被持久化接纳（admitted）的工作 —— 这个区别后面会反复出现。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 820 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="分层架构图">
+      <rect x="30" y="20" width="760" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="410" y="46" text-anchor="middle" style="fill:var(--accent)" font-size="14" font-weight="700">你的宿主程序（聊天产品 / 编程智能体 / 服务端）</text>
+      <text x="410" y="66" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">用 Harness / Conversation / 工具 API 驱动一切</text>
+      <line x1="410" y1="80" x2="410" y2="105" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="410,112 404,102 416,102" style="fill:var(--muted)"/>
+      <rect x="30" y="115" width="760" height="90" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="410" y="140" text-anchor="middle" style="fill:var(--accent-2)" font-size="14" font-weight="700">pi-durable（本书）</text>
+      <rect x="55" y="155" width="160" height="34" rx="5" style="fill:var(--surface);stroke:var(--muted)"/>
+      <text x="135" y="177" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Harness + 调度器</text>
+      <rect x="235" y="155" width="160" height="34" rx="5" style="fill:var(--surface);stroke:var(--muted)"/>
+      <text x="315" y="177" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Session（提交线）</text>
+      <rect x="415" y="155" width="160" height="34" rx="5" style="fill:var(--surface);stroke:var(--muted)"/>
+      <text x="495" y="177" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">任务 / 工具 / 扩展</text>
+      <rect x="595" y="155" width="170" height="34" rx="5" style="fill:var(--surface);stroke:var(--muted)"/>
+      <text x="680" y="177" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">视图 / 事件流</text>
+      <line x1="260" y1="205" x2="260" y2="232" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="260,239 254,229 266,229" style="fill:var(--muted)"/>
+      <line x1="560" y1="205" x2="560" y2="232" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="560,239 554,229 566,229" style="fill:var(--muted)"/>
+      <rect x="30" y="242" width="380" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="220" y="268" text-anchor="middle" style="fill:var(--pass)" font-size="13" font-weight="700">pi-ai（模型访问）+ chord（文档/取消）</text>
+      <text x="220" y="288" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">被 pi-durable 依赖，你也直接用它们的类型</text>
+      <rect x="430" y="242" width="360" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="610" y="268" text-anchor="middle" style="fill:var(--pass)" font-size="13" font-weight="700">Storage 后端</text>
+      <text x="610" y="288" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Memory / SQLite / JSONL / Cloudflare DO</text>
+    </svg>
+    <figcaption>pi-durable 的位置：对上提供 Harness/会话/工具 API，对下把一切写入 Storage，模型访问外包给 pi-ai，文档与取消机制外包给 chord。</figcaption>
+  </figure>
+
+  <p>
+    目录结构也印证这个分层（<code>packages/durable/src/</code>）：
+    <code>session/</code> 是提交线与会话内核（第 6 章），
+    <code>harness/</code> 是智能体机械（第 5、7、9、10 章），
+    <code>storage/</code> 是四个后端（第 4 章），
+    <code>tools/</code>、<code>env/</code>、<code>images/</code> 是内置工具与执行环境（第 8 章），
+    <code>codemode/</code>、<code>tool-search/</code> 是可选扩展（第 9 章）。
+  </p>
+
+  <h2 id="sec-recap">1.5 本章回顾</h2>
+  <ul>
+    <li>pi 是一个 monorepo；pi-durable 是其中提供"持久化会话 / 任务 / 文档运行时"的实验性包（1.3.0）。</li>
+    <li>长时智能体 + 进程随时会死 = 需要持久化执行：断点续跑、不重放副作用、存储与展示永远一致。</li>
+    <li>三个核心设计：唯一写入口（原子 commit）、任务即带检查点的状态机、UI 只读已提交状态。</li>
+    <li>每个异步 API 都吃一个 Chord <code>Context</code>（取消令牌）；取消等待 ≠ 取消工作。</li>
+    <li>依赖：pi-ai（模型）、chord（文档/取消）；自己提供四种 Storage 后端。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误解</div>
+    <ul style="margin:0;">
+      <li><strong>把 commit 当成 git commit。</strong>这里是"一次原子存储写入"的运行时概念，与版本控制无关。</li>
+      <li><strong>以为 pi-durable 会自动连模型。</strong>模型目录（<code>Models</code>）由你通过 pi-ai 构建后传入，它只是使用。</li>
+      <li><strong>以为持久化 = 定期保存。</strong>这里是"任何东西展示之前其提交必须已落盘"，顺序是设计出来的，不是定时刷盘。</li>
+      <li><strong>以为它稳定。</strong>README 明说 Experimental：API 会在版本间无预警变化。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="1">
+    <h2>第 1 章测试</h2>
+
+    <div class="q" data-id="1-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — pi-durable 是持久化的会话/任务/文档运行时，模型访问由 pi-ai 负责。"
+         data-rationale="B 正确：模型请求统一走 pi-ai，pi-durable 只持有 Models 目录对象。A 错在把模型访问算进来；C 错在它是库（runtime）而非终端产品，终端产品是 pi-coding-agent；D 完全颠倒了它的定位。"
+         data-review="sec-what-is-pi">
+      <div class="prompt"><span class="qnum">Q1.</span> 关于 pi-durable 的定位，哪句是对的？</div>
+      <label class="opt"><input type="radio" name="q-1-1" value="a"> A. 它直接对接各家大模型 API，负责发请求</label>
+      <label class="opt"><input type="radio" name="q-1-1" value="b"> B. 它是面向 Pi 的持久化会话/任务/文档运行时，模型访问外包给 pi-ai</label>
+      <label class="opt"><input type="radio" name="q-1-1" value="c"> C. 它是 pi 仓库里那个终端编程助手本身</label>
+      <label class="opt"><input type="radio" name="q-1-1" value="d"> D. 它是一个数据库驱动包，不关心智能体</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C — 有副作用的操作（如 npm test）在重启后被原样重放一遍。"
+         data-rationale="C 是朴素实现最阴险的失败模式：重放对话会把 bash 这类副作用再执行一次。A/B 是丢数据但可恢复；D 说反了，内存态恰恰是全部蒸发。"
+         data-review="sec-problem">
+      <div class="prompt"><span class="qnum">Q2.</span> 进程在工具执行中途崩溃后重启，朴素（纯内存）实现里<strong>最危险</strong>的后果是什么？</div>
+      <label class="opt"><input type="radio" name="q-1-2" value="a"> A. 用户的输入丢了，要重新问</label>
+      <label class="opt"><input type="radio" name="q-1-2" value="b"> B. 模型回复的半截文本丢了</label>
+      <label class="opt"><input type="radio" name="q-1-2" value="c"> C. 有副作用的操作（比如 npm test）被原样重放一遍</label>
+      <label class="opt"><input type="radio" name="q-1-2" value="d"> D. 内存里的状态会自动写入磁盘</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-3" data-type="mcq" data-correct='["a"]'
+         data-answer="A — committed before shown：任何东西展示之前，它的提交必须已经落盘。"
+         data-rationale="A 是 README 原文的承诺。B 顺序反了（先提交后展示）；C 定时快照会留下半截状态，正是要避免的；D 与是否可观测无关。"
+         data-review="sec-idea">
+      <div class="prompt"><span class="qnum">Q3.</span> "先提交、后展示"（committed before anything is shown）意味着什么？</div>
+      <label class="opt"><input type="radio" name="q-1-3" value="a"> A. 一条消息/状态在任何人看到它之前，它的原子提交已经写入存储</label>
+      <label class="opt"><input type="radio" name="q-1-3" value="b"> B. 先在界面上显示，稍后再批量写盘</label>
+      <label class="opt"><input type="radio" name="q-1-3" value="c"> C. 每分钟定时把内存快照写进文件</label>
+      <label class="opt"><input type="radio" name="q-1-3" value="d"> D. 只要没人盯着界面看，就不需要存储</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-4" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A、C、D。"
+         data-rationale="A/C/D 都是：commit 是原子写入口；任务是带检查点的状态机；UI 只读已提交状态。B 错——pi-durable 恰恰不认识具体模型厂商，模型访问全在 pi-ai。"
+         data-review="sec-idea">
+      <div class="prompt"><span class="qnum">Q4.</span> 以下哪些属于 pi-durable 的核心设计决定？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-1-4" value="a"> A. 所有修改走唯一的原子提交（commit）入口</label>
+      <label class="opt"><input type="checkbox" name="q-1-4" value="b"> B. 内置各模型厂商的 HTTP 客户端</label>
+      <label class="opt"><input type="checkbox" name="q-1-4" value="c"> C. 任务是带检查点的状态机，重启后从上一个检查点继续</label>
+      <label class="opt"><input type="checkbox" name="q-1-4" value="d"> D. 界面只订阅已提交的存储状态</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-5" data-type="fill" data-accepted='["background_context","backgroundcontext"]'
+         data-answer="BACKGROUND_CONTEXT"
+         data-rationale="BACKGROUND_CONTEXT 是永不取消的 Context，快速示例里所有调用都传它。"
+         data-review="sec-stack">
+      <div class="prompt"><span class="qnum">Q5.</span> 填空：pi-durable 中永不取消、快速示例默认使用的 Chord 取消上下文叫 <code>______</code>。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-6" data-type="mcq" data-correct='["b"]'
+         data-answer="B — 取消一个 wait() 只取消这次等待，已被持久化接纳的工作照常进行。"
+         data-rationale="B 是明确设计：Context 取消是读侧/等待侧的取消，不触及已接纳的持久工作。A/C/D 都把取消夸大成了撤回工作。"
+         data-review="sec-stack">
+      <div class="prompt"><span class="qnum">Q6.</span> 你对 <code>submission.wait(context)</code> 传入了一个随后被取消的 context。会发生什么？</div>
+      <label class="opt"><input type="radio" name="q-1-6" value="a"> A. 这次提交本身被撤回，模型不再回答</label>
+      <label class="opt"><input type="radio" name="q-1-6" value="b"> B. 只有这次等待被取消；已被持久化接纳的工作照常进行</label>
+      <label class="opt"><input type="radio" name="q-1-6" value="c"> C. 整个 Harness 关闭</label>
+      <label class="opt"><input type="radio" name="q-1-6" value="d"> D. 会话被 abort，运行中的工具全部停止</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-7" data-type="mcq" data-correct='["d"]'
+         data-answer="D — chord 提供类型化 JSON 文档、增量操作、可订阅状态与 Context 取消机制。"
+         data-rationale="D 正确。模型访问是 pi-ai（A）；SQLite/JSONL 是 pi-durable 自己的 storage/（B）；工具定义用 TypeBox schema，但那是 pi-ai 透出的能力之一，chord 的身份是文档状态框架（C 混淆了）。"
+         data-review="sec-stack">
+      <div class="prompt"><span class="qnum">Q7.</span> 依赖包 <code>@earendil-works/chord</code> 在这套体系里提供什么？</div>
+      <label class="opt"><input type="radio" name="q-1-7" value="a"> A. 大模型请求与流式解析</label>
+      <label class="opt"><input type="radio" name="q-1-7" value="b"> B. SQLite 与 JSONL 存储后端</label>
+      <label class="opt"><input type="radio" name="q-1-7" value="c"> C. 工具参数的 TypeBox 校验</label>
+      <label class="opt"><input type="radio" name="q-1-7" value="d"> D. 类型化 JSON 文档状态、增量操作、可订阅状态与 Context 取消</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C — 大约 100ms 的流式进度窗口（默认 progress 间隔）。"
+         data-rationale="C：默认每 100ms 提交一次部分回答与工具输出，崩溃最多丢这一个窗口。A 说全部蒸发是内存实现；B 的持久工作不会丢；D 顺序写反了。"
+         data-review="sec-problem">
+      <div class="prompt"><span class="qnum">Q8.</span> 按 pi-durable 的默认行为，进程崩溃最多损失什么？</div>
+      <label class="opt"><input type="radio" name="q-1-8" value="a"> A. 整个对话历史</label>
+      <label class="opt"><input type="radio" name="q-1-8" value="b"> B. 所有已接纳的提交</label>
+      <label class="opt"><input type="radio" name="q-1-8" value="c"> C. 大约 100ms 窗口内尚未提交的流式进度</label>
+      <label class="opt"><input type="radio" name="q-1-8" value="d"> D. 什么都不损失，因为先展示后提交</label>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测试</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测试</button>
+  </form>
+
+  <p style="margin-top:2rem; color:var(--muted);">
+    下一章：<a href="02-core-concepts.html"><strong>第 2 章 — 核心概念词汇表</strong></a>，把 Harness、Conversation、Entry、Commit、Document、Task、Submission 这些词一次讲清。
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

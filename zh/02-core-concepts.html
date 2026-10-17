@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 2 章 — 核心概念词汇表</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ pi-durable 源码导读</a>
+  <span class="crumb">第 2 章 · 核心概念</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="2">
+<script>window.BOOK_CONFIG = { slug: "pi-durable", lang: "zh", chapters: [{n:1,slug:"01-what-and-why"},{n:2,slug:"02-core-concepts"},{n:3,slug:"03-quick-start"},{n:4,slug:"04-storage-and-resume"},{n:5,slug:"05-api-panorama"},{n:6,slug:"06-commit-and-documents"},{n:7,slug:"07-tasks"},{n:8,slug:"08-tools-and-env"},{n:9,slug:"09-extensions-and-agent"},{n:10,slug:"10-inbox-watch-errors"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 2 章 · 词汇表</div>
+    <h1>核心概念：Harness、Conversation、Entry、Commit、Document、Task、Submission</h1>
+    <p class="lede">
+      pi-durable 的 API 读起来费劲，八成是因为这七个名词。本章把它们一次讲透 —— 每个词是什么、
+      不是什么、放在哪一层。之后所有章节都建立在这套词汇上。你问的"commit 到底是个什么东西"，
+      答案就在 2.4 节。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能不看资料说出七个核心名词各自的定义与所属层次</li>
+      <li>能解释 Entry 的双通道结构（model 消息 vs data 数据）和 <code>head</code> 的作用</li>
+      <li>能准确描述 commit 的原子性保证，以及"一次 commit 里能同时做哪三类事"</li>
+      <li>能读懂 README 里那段"一次输入对应的 entries 与 tasks"轨迹图</li>
+      <li>能列出五个内置文档（pi.agent / pi.provider / pi.live / pi.inbox / pi.usage）各自的用途</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-harness">2.1 Harness：一个打开的存储 + 智能体机械</h2>
+  <p>
+    <strong>Harness</strong>（<code>src/harness/harness.ts:181</code>，<code>class HarnessImpl</code>）
+    是你拿到手的根对象：一份打开的存储（Session），加上在它上面跑智能体的全部机械 ——
+    任务调度器、提交（submission）管理、视图（view）、注册表（registry）引用。
+    README 的措辞是："one open storage plus the machinery that runs agents on it"。
+    关键性质：
+  </p>
+  <ul>
+    <li>所有变更都汇进<strong>同一条原子提交线</strong>（mutation line），由底层 Session 串行化；</li>
+    <li>Harness 是有生命周期的：<code>Harness.open()</code> 创建，<code>close()</code> 或一次存储错误终结；</li>
+    <li>它自己几乎不存状态在内存里 —— 机器读的、UI 看的，都来自存储。</li>
+  </ul>
+
+  <h2 id="sec-conversation">2.2 Conversation：一份 transcripts（会话记录）</h2>
+  <p>
+    <strong>Conversation</strong>（会话）就是一个<strong>不可变条目的序列</strong> —— 一份对话记录。
+    注意三点，都是从 <code>src/harness/types.ts:653</code> 的接口注释里来的：
+  </p>
+  <ul>
+    <li><strong>句柄无状态。</strong>你拿到的 <code>Conversation</code> 对象只是个把手，比较两个会话要用 <code>id</code>，不是 <code>===</code>。</li>
+    <li><strong>root 会话</strong>：每个存储有一个保留的根会话，<code>harness.root()</code> 第一次调用时创建它，ID 恒为 <code>ROOT_CONVERSATION_ID = 1</code>（<code>src/types.ts:39</code>）。跨进程重开存储，<code>root()</code> 拿到的还是同一个会话。</li>
+    <li>还可以创建<strong>独立会话</strong>（<code>createConversation()</code>）和<strong>分叉</strong>（<code>fork(entryId)</code>，从某条历史条目开始另起炉灶）。</li>
+  </ul>
+
+  <h2 id="sec-entry">2.3 Entry：一条不可变的记录，双通道</h2>
+  <p>
+    <strong>Entry</strong>（条目）是会话里的最小记录单位，定义在 <code>src/types.ts:334</code>
+    （<code>EntryRecord</code>）。一条条目一经提交就<strong>永不修改</strong> —— 想改历史，只能追加新条目去覆盖。
+    它有两个互不干扰的通道：
+  </p>
+  <ul>
+    <li><code>model</code>：这条条目<strong>贡献给模型上下文的消息</strong>（比如一条 user 消息或 assistant 消息）。没有 <code>model</code> 的条目，模型根本看不见 —— 纯粹是给你的 UI 或记账用的。</li>
+    <li><code>data</code>：给<strong>应用层</strong>的 JSON 载荷（例如聊天消息的作者、头像这类 UI 数据）。</li>
+  </ul>
+  <p>其余字段：<code>kind</code>（种类标签）、<code>head</code>（激活上下文的起点标记，见下）、<code>edits</code>（对更早条目模型消息的省略/替换）、<code>byTaskId</code>（哪个任务写的）。</p>
+  <p>
+    内置的六种条目定义在 <code>src/entries.ts:15-34</code>，全部以 <code>pi.</code> 开头：
+  </p>
+  <ul>
+    <li><code>pi.user</code> — 用户输入（<code>model</code> 是一条 UserMessage）。由 submission 写入。</li>
+    <li><code>pi.assistant</code> — 模型的一次回复（一条 AssistantMessage，可能带工具调用）。由 generation 任务写入。</li>
+    <li><code>pi.system</code> — 系统提示词/工具变化的<strong>位置标记</strong>：模型看到的系统提示词变化被存成这种条目，只有变化的部分才重发，用来保温提供商的 prompt 缓存。</li>
+    <li><code>pi.tool-result</code> — 工具结果（一条 ToolResultMessage + <code>data.diagnostics</code>）。由工具任务写入。</li>
+    <li><code>pi.reset</code> — 重置：新上下文的起点，<code>head: "self"</code>。老条目留在存储里，但模型不再看见。</li>
+    <li><code>pi.compaction</code> — 压缩摘要：把旧上下文总结成一条，<code>head</code> 指向保留的第一条条目。</li>
+  </ul>
+  <p>
+    <strong>head 是什么？</strong>模型看到的"激活上下文"不是全部历史，而是<strong>从最新的 head 标记开始</strong>
+    到尾部的那段。<code>pi.reset</code> 和 <code>pi.compaction</code> 都会立起一个新的 head，
+    于是更早的条目自动退出模型视野（但仍在存储里，供你翻旧账）。
+    自定义条目种类不能以 <code>pi.</code> 开头 —— 这是保留前缀。
+  </p>
+
+  <h2 id="sec-commit">2.4 Commit：一次原子写入（你问的那个 commit）</h2>
+  <p>
+    <strong>Commit 不是 git 概念</strong>。它是 pi-durable 自己的一等公民：
+    <strong>一次要么全有、要么全无的存储写入</strong>。README 的定义原文：
+    "an atomic write. <code>conversation.commit((tx) =&gt; ...)</code> can append entries,
+    edit documents, and create tasks together; either all of it is stored or none of it is."
+  </p>
+  <p>用法形态是一个事务回调：</p>
+  <pre><code>const result = await conversation.commit(async (tx) =&gt; {
+	const entry = await tx.appendEntry(conversation.id, { kind: "app.note", data: { text: "hi" } });
+	const todos = await tx.doc(Todos, conversation.id);
+	todos.items.push("写一条笔记");
+	await tx.createTask(MyTask, input, { ownership: { kind: "conversation" } });
+	return entry.id; // 回调的返回值就是 commit() 的返回值
+}, context);</code></pre>
+  <p>一次 commit 里可以同时做三类事，并且<strong>作为整体</strong>落盘：</p>
+  <ul>
+    <li><strong>追加条目</strong>（<code>tx.appendEntry</code>）— 改对话记录；</li>
+    <li><strong>编辑文档</strong>（<code>tx.doc(...)</code> 返回可变的 Draft，改完自动算增量）— 改结构化状态；</li>
+    <li><strong>创建任务 / 提交记录</strong>（<code>tx.createTask</code>、<code>tx.createSubmission</code> 等）— 安排工作。</li>
+  </ul>
+  <p>
+    原子性的两个推论，后面章节会反复用到：
+    回调<strong>抛异常则整个回滚</strong>，一条都不会写入；
+    观察者（watch）看到的永远是完整的提交，不存在"半个提交"的中间态。
+    commit 落盘后拿到一个严格递增的序号 <code>Seq</code>（<code>src/types.ts:36</code>），
+    整个存储的历史就是 Seq 的序列。第 6 章把 Tx 的每个方法拆开讲。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 820 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="commit 结构图">
+      <text x="410" y="26" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">一次 commit：回调里做的事 → 一批写入 → 原子落盘 → 广播</text>
+      <rect x="30" y="45" width="340" height="240" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="200" y="70" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">事务回调 (tx) =&gt; {...}</text>
+      <rect x="55" y="88" width="290" height="34" rx="5" style="fill:var(--surface);stroke:var(--muted)"/>
+      <text x="200" y="110" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">tx.appendEntry(...) — 追加条目</text>
+      <rect x="55" y="132" width="290" height="34" rx="5" style="fill:var(--surface);stroke:var(--muted)"/>
+      <text x="200" y="154" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">tx.doc(Todos, id).items.push(...) — 改文档</text>
+      <rect x="55" y="176" width="290" height="34" rx="5" style="fill:var(--surface);stroke:var(--muted)"/>
+      <text x="200" y="198" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">tx.createTask(...) — 创建任务</text>
+      <text x="200" y="250" text-anchor="middle" style="fill:var(--warn)" font-size="11">回调抛异常 → 整个提交作废，零写入</text>
+      <text x="200" y="272" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">回调返回值 = commit() 的返回值</text>
+      <line x1="370" y1="165" x2="430" y2="165" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="438,165 428,159 428,171" style="fill:var(--muted)"/>
+      <text x="404" y="150" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">writes[]</text>
+      <rect x="440" y="115" width="170" height="100" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="525" y="140" text-anchor="middle" style="fill:var(--accent-2)" font-size="13" font-weight="700">storage.commit()</text>
+      <text x="525" y="165" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">一批 StorageWrite</text>
+      <text x="525" y="185" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">原子持久化</text>
+      <text x="525" y="205" text-anchor="middle" style="fill:var(--pass)" font-size="11">返回 Seq（递增序号）</text>
+      <line x1="610" y1="165" x2="655" y2="165" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="663,165 653,159 653,171" style="fill:var(--muted)"/>
+      <rect x="665" y="115" width="125" height="100" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="727" y="145" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">广播</text>
+      <text x="727" y="168" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">watch 帧</text>
+      <text x="727" y="186" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">事件流</text>
+      <text x="727" y="204" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">订阅者</text>
+      <text x="410" y="310" text-anchor="middle" style="fill:var(--muted)" font-size="11" font-style="italic">同一 Seq 内的变更对观察者一次性可见 —— 不存在中间态</text>
+    </svg>
+    <figcaption>commit 的完整路径。回调 → 一批写入 → 原子落盘（拿到 Seq）→ 以完整提交为单位广播给所有观察者。</figcaption>
+  </figure>
+
+  <h2 id="sec-document">2.5 Document：住在会话旁边的类型化 JSON 状态</h2>
+  <p>
+    <strong>Document</strong>（文档）是与会话记录并存的结构化状态：一个带类型、带版本号的 JSON 对象，
+    用 <code>defineDoc()</code> 声明（第 6 章详讲），<strong>只能在 commit 里改</strong>。
+    它和条目的分工是：条目是"发生过什么"的日志，文档是"现在是什么样"的快照。
+  </p>
+  <p>五个内置文档（都在 commit 里被 Harness 自己维护）：</p>
+  <ul>
+    <li><code>pi.agent</code> — 这个会话用什么跑：模型、思考等级、扩展、工具、指令、工作目录（<code>src/harness/agent.ts:43</code>）。</li>
+    <li><code>pi.provider</code> — 面向提供商的会话身份（一个持久化的 UUIDv7），重开、重试、重置、压缩、换模型都不变；转发给 pi-ai 当 <code>sessionId</code>，用来命中提供商的 prompt 缓存。</li>
+    <li><code>pi.live</code> — 正在发生什么：流式中的回答、重试、每个工具调用的输出与详情。UI 的"实时感"全来自它。</li>
+    <li><code>pi.inbox</code> — 排队中的提交：会话忙时新输入在这里排队（第 10 章）。</li>
+    <li><code>pi.usage</code> — 花了多少钱：按 provider/model 和按工具名累计的 token 与费用。</li>
+  </ul>
+
+  <h2 id="sec-task">2.6 Task：带检查点的状态机，人人都有 owner</h2>
+  <p>
+    <strong>Task</strong>（任务）是一件持久化的工作，本质是个<strong>状态机</strong>：
+    它的定义是一组阶段（phase）处理器，每走一步之前先把"检查点"（下一步从哪继续的全部状态）提交进存储。
+    进程死了，任务回到 pending；下次调度时从检查点继续。<code>src/types.ts:244</code> 的
+    <code>TaskDefinition</code> 是完整形状（第 7 章细讲）。
+  </p>
+  <p>
+    最重要的规则：<strong>每个任务都有唯一所有者（owner）</strong> —— 要么是它所在的会话（顶层任务），
+    要么是同会话里的另一个任务（子任务）。所有权构成一棵树，"中止"沿树级联：
+    中止一个任务会先中止它拥有的一切。pi-durable 自己的回答、工具执行、摘要压缩都是内置任务：
+    <code>pi.generation</code>（调模型）、<code>pi.tool</code>（执行一次工具调用）、<code>pi.compaction</code>（做摘要）。
+  </p>
+
+  <h2 id="sec-submission">2.7 Submission 与 turn / run</h2>
+  <p>
+    <strong>Submission</strong>（提交记录）是你交给会话的一样东西：要么是<strong>用户输入</strong>
+    （input，会触发一轮模型工作），要么是<strong>被动写入</strong>（write，只追加条目、不打扰模型）。
+    <code>submit()</code> 返回的对象可以 <code>wait()</code>（等到 done / unanswered）、<code>abort()</code>（撤回还在排队的）。
+    它是持久化的 —— 重启后还能用 <code>harness.submission(id)</code> 重新拿回来。
+  </p>
+  <p>最后两个小词：</p>
+  <ul>
+    <li><strong>turn（轮）</strong>：模型的一次回复加上它的工具调用；</li>
+    <li><strong>run（运行）</strong>：从一条输入到它最终回答之间的所有轮。会话在 run 进行中就是"忙"（busy）。</li>
+  </ul>
+
+  <h2 id="sec-trace">2.8 把词串起来：一次"你问 — 它答"的解剖图</h2>
+  <p>下面是 README 的轨迹图（略有展开），每一行左边是任务、右边是它写入的条目：</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 820 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="一次输入的条目与任务轨迹">
+      <text x="60" y="30" style="fill:var(--accent)" font-size="12" font-weight="700">任务（谁在干活）</text>
+      <text x="330" y="30" style="fill:var(--accent-2)" font-size="12" font-weight="700">写入的条目（会话记录）</text>
+      <rect x="20" y="45" width="270" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--muted)"/>
+      <text x="155" y="66" text-anchor="middle" style="fill:var(--fg)" font-size="11">submit(input) 接纳输入</text>
+      <line x1="290" y1="62" x2="325" y2="62" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <polygon points="331,62 323,58 323,66" style="fill:var(--muted)"/>
+      <rect x="335" y="45" width="200" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)"/>
+      <text x="435" y="66" text-anchor="middle" style="fill:var(--fg)" font-size="11">pi.user（用户消息）</text>
+      <rect x="20" y="100" width="270" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+      <text x="155" y="121" text-anchor="middle" style="fill:var(--accent)" font-size="11">pi.generation（第 1 轮）</text>
+      <line x1="290" y1="117" x2="325" y2="117" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <polygon points="331,117 323,113 323,121" style="fill:var(--muted)"/>
+      <rect x="335" y="88" width="200" height="24" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)"/>
+      <text x="435" y="105" text-anchor="middle" style="fill:var(--fg)" font-size="10">pi.system（仅当提示词/工具有变化）</text>
+      <rect x="335" y="118" width="200" height="24" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)"/>
+      <text x="435" y="135" text-anchor="middle" style="fill:var(--fg)" font-size="10">pi.assistant（带工具调用）</text>
+      <rect x="20" y="155" width="270" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+      <text x="155" y="176" text-anchor="middle" style="fill:var(--fg)" font-size="11">pi.tool × n（generation 的子任务）</text>
+      <line x1="290" y1="172" x2="325" y2="172" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <polygon points="331,172 323,168 323,176" style="fill:var(--muted)"/>
+      <rect x="335" y="155" width="200" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)"/>
+      <text x="435" y="176" text-anchor="middle" style="fill:var(--fg)" font-size="11">pi.tool-result × n</text>
+      <rect x="20" y="210" width="270" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+      <text x="155" y="231" text-anchor="middle" style="fill:var(--accent)" font-size="11">pi.generation（第 2 轮，收工具结果）</text>
+      <line x1="290" y1="227" x2="325" y2="227" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <polygon points="331,227 323,223 323,231" style="fill:var(--muted)"/>
+      <rect x="335" y="210" width="200" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--pass)"/>
+      <text x="435" y="231" text-anchor="middle" style="fill:var(--fg)" font-size="11">pi.assistant（最终回答）</text>
+      <line x1="290" y1="282" x2="325" y2="282" style="stroke:var(--pass)" stroke-width="1.5"/>
+      <polygon points="331,282 323,278 323,286" style="fill:var(--pass)"/>
+      <rect x="335" y="265" width="240" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="455" y="280" text-anchor="middle" style="fill:var(--pass)" font-size="11" font-weight="700">submission 状态 → done</text>
+      <text x="455" y="294" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">wait() 的等待者在此刻醒来</text>
+      <text x="410" y="340" text-anchor="middle" style="fill:var(--muted)" font-size="11" font-style="italic">一个 run = 两次 turn。每个方框落盘前都先经过一次 commit。</text>
+    </svg>
+    <figcaption>submit → pi.user → generation（轮 1：assistant 带工具调用）→ 工具子任务 → tool-result → generation（轮 2：最终回答）→ submission done。</figcaption>
+  </figure>
+
+  <h2 id="sec-recap">2.9 本章回顾</h2>
+  <ul>
+    <li>Harness = 打开的存储 + 智能体机械；Conversation = 不可变条目序列；句柄无状态，按 <code>id</code> 比较。</li>
+    <li>Entry 双通道：<code>model</code> 给模型、<code>data</code> 给应用；<code>head</code> 标记激活上下文起点。</li>
+    <li>Commit = 一次原子写入：条目 + 文档 + 任务打包落盘，回调抛异常则全回滚；落盘得 <code>Seq</code>。</li>
+    <li>Document = 类型化 JSON 状态，只能在 commit 里改；内置五个：<code>pi.agent / pi.provider / pi.live / pi.inbox / pi.usage</code>。</li>
+    <li>Task = 带检查点的状态机，必有 owner；内置 <code>pi.generation / pi.tool / pi.compaction</code>。</li>
+    <li>Submission = 被持久接纳的输入或写入，可 wait / abort / 重启后找回；turn 是一轮，run 是一整个回答过程。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li><strong>"改一条旧消息"。</strong>条目不可变；正确做法是追加新条目（或用 <code>edits</code> 在上下文层面省略/替换旧消息的贡献）。</li>
+      <li><strong>把 <code>pi.live</code> 当内存变量。</strong>它是已提交的文档；"实时"是高频小提交的观感，不是绕过存储。</li>
+      <li><strong>自定义条目 kinds 用 <code>pi.</code> 前缀。</strong>保留前缀，会被拒。</li>
+      <li><strong>以为 reset/压缩删除历史。</strong>它们只移动 head；旧条目仍在存储里，<code>entries()</code> 翻得到。</li>
+      <li><strong>在 commit 回调里调 Session 的读方法。</strong>回调持有提交线，直读 Session 可能排队死锁；回调里只准用 <code>tx</code>（第 6 章展开）。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="2">
+    <h2>第 2 章测试</h2>
+
+    <div class="q" data-id="2-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — model 是给模型上下文的消息，data 是给应用层的 JSON 载荷。"
+         data-rationale="B 正确。A 把两者颠倒；C 错，没有 model 的条目模型完全看不见；D 错，kind 只是种类的标签字符串。"
+         data-review="sec-entry">
+      <div class="prompt"><span class="qnum">Q1.</span> Entry 的 <code>model</code> 与 <code>data</code> 字段分别服务谁？</div>
+      <label class="opt"><input type="radio" name="q-2-1" value="a"> A. model 给应用层，data 给大模型</label>
+      <label class="opt"><input type="radio" name="q-2-1" value="b"> B. model 是贡献给模型上下文的消息，data 是应用层 JSON 载荷</label>
+      <label class="opt"><input type="radio" name="q-2-1" value="c"> C. 两者都是给模型的，只是格式不同</label>
+      <label class="opt"><input type="radio" name="q-2-1" value="d"> D. data 是条目的 kind 标签</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C — 模型看到的是从最新 head 标记开始到尾部的条目。"
+         data-rationale="C 正确：reset 和 compaction 会立起新 head，更早的条目退出模型视野但仍留在存储。A/B 都与不可变条目设计冲突；D 忽略了 head 机制。"
+         data-review="sec-entry">
+      <div class="prompt"><span class="qnum">Q2.</span> 执行 <code>reset()</code> 之后，模型在下一轮看到什么？</div>
+      <label class="opt"><input type="radio" name="q-2-2" value="a"> A. 全部历史，因为条目都还在</label>
+      <label class="opt"><input type="radio" name="q-2-2" value="b"> B. 空 —— reset 把旧条目从存储里删了</label>
+      <label class="opt"><input type="radio" name="q-2-2" value="c"> C. 从最新 head 标记（新上下文起点）到尾部的条目；旧条目仍在存储里</label>
+      <label class="opt"><input type="radio" name="q-2-2" value="d"> D. 只看到最后一条 assistant 消息</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-3" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A、C、D。"
+         data-rationale="一次 commit 恰好能同时做这三件事并原子落盘。B 不行：模型请求由 generation 任务在提交线之外发起，不是 commit 回调的一部分。"
+         data-review="sec-commit">
+      <div class="prompt"><span class="qnum">Q3.</span> 以下哪些可以放进<strong>同一次</strong> <code>conversation.commit()</code> 里完成？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-2-3" value="a"> A. 追加一条自定义条目</label>
+      <label class="opt"><input type="checkbox" name="q-2-3" value="b"> B. 向模型供应商发起一次流式请求并等待完成</label>
+      <label class="opt"><input type="checkbox" name="q-2-3" value="c"> C. 修改一个文档（如向 pi.agent 换模型）</label>
+      <label class="opt"><input type="checkbox" name="q-2-3" value="d"> D. 创建一个任务</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-4" data-type="mcq" data-correct='["d"]'
+         data-answer="D — 回调抛异常时整批写入都不发生（回滚）。"
+         data-rationale="D 是原子性的直接推论。A/C 都描述了半提交状态，恰恰被设计排除；B 无中生有。"
+         data-review="sec-commit">
+      <div class="prompt"><span class="qnum">Q4.</span> commit 回调里成功追加了条目，随后改文档时抛了异常。存储里会留下什么？</div>
+      <label class="opt"><input type="radio" name="q-2-4" value="a"> A. 那条条目，因为 appendEntry 已经执行</label>
+      <label class="opt"><input type="radio" name="q-2-4" value="b"> B. 条目加一个空的文档</label>
+      <label class="opt"><input type="radio" name="q-2-4" value="c"> C. 条目和一条错误日志</label>
+      <label class="opt"><input type="radio" name="q-2-4" value="d"> D. 什么都没有 —— 整个提交回滚</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-5" data-type="fill" data-accepted='["seq","序号","seq 序号"]'
+         data-answer="Seq（严格递增的提交序号）"
+         data-rationale="storage.commit() 返回 Seq —— 分配给一次原子提交的严格递增序号，存储的整个历史就是 Seq 序列。"
+         data-review="sec-commit">
+      <div class="prompt"><span class="qnum">Q5.</span> 填空：每次提交落盘后，存储分配给这次原子写入的严格递增序号叫 <code>______</code>。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-6" data-type="mcq" data-correct='["a"]'
+         data-answer="A — pi.live：运行中的生成（流式半成品、重试）与各工具调用的输出与详情。"
+         data-rationale="A 正确。排队输入在 pi.inbox（B）；模型选择在 pi.agent（C）；花钱在 pi.usage（D）。"
+         data-review="sec-document">
+      <div class="prompt"><span class="qnum">Q6.</span> UI 想显示"正在流式输出的半截回答"和"工具跑到一半的输出"，应读哪个文档？</div>
+      <label class="opt"><input type="radio" name="q-2-6" value="a"> A. <code>pi.live</code></label>
+      <label class="opt"><input type="radio" name="q-2-6" value="b"> B. <code>pi.inbox</code></label>
+      <label class="opt"><input type="radio" name="q-2-6" value="c"> C. <code>pi.agent</code></label>
+      <label class="opt"><input type="radio" name="q-2-6" value="d"> D. <code>pi.usage</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-7" data-type="mcq" data-correct='["b"]'
+         data-answer="B — 一个任务：每个任务必有 owner（会话或另一个任务）。"
+         data-rationale="B 是所有权模型的定义。工具调用是 pi.tool 任务、由 generation 拥有，不是 submission（C）、不是条目（D）、更不是独立无主（A）。"
+         data-review="sec-task">
+      <div class="prompt"><span class="qnum">Q7.</span> 模型在 run 中发起的一次工具调用，在 pi-durable 里是什么？</div>
+      <label class="opt"><input type="radio" name="q-2-7" value="a"> A. 一段在 generation 里直接执行的代码，没有独立身份</label>
+      <label class="opt"><input type="radio" name="q-2-7" value="b"> B. 一个 <code>pi.tool</code> 任务，被 generation 任务拥有</label>
+      <label class="opt"><input type="radio" name="q-2-7" value="c"> C. 一个新的 submission</label>
+      <label class="opt"><input type="radio" name="q-2-7" value="d"> D. 一条 pi.tool-result 条目，不涉及任务</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-8" data-type="fill" data-accepted='["1","root_conversation_id","1(root)","根会话 id 恒为 1"]'
+         data-answer="1（ROOT_CONVERSATION_ID）"
+         data-rationale="根会话使用保留 ID 1（ROOT_CONVERSATION_ID，src/types.ts:39），所以跨进程重开 root() 拿到的是同一个会话。"
+         data-review="sec-conversation">
+      <div class="prompt"><span class="qnum">Q8.</span> 填空：根会话使用保留 ID，恒为 <code>______</code>。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-9" data-type="mcq" data-correct='["c"]'
+         data-answer="C — pi.provider：持久化的 UUIDv7，转发给 pi-ai 作 sessionId，保温 prompt 缓存。"
+         data-rationale="C 正确：该身份在重开、重试、重置、压缩、换模型后都不变；分叉/子会话拿到新的身份。A 是模型配置；B 是运行状态；D 是计费。"
+         data-review="sec-document">
+      <div class="prompt"><span class="qnum">Q9.</span> 哪个内置文档解释了"为什么重开进程后提供商的 prompt 缓存还能命中"？</div>
+      <label class="opt"><input type="radio" name="q-2-9" value="a"> A. <code>pi.agent</code></label>
+      <label class="opt"><input type="radio" name="q-2-9" value="b"> B. <code>pi.live</code></label>
+      <label class="opt"><input type="radio" name="q-2-9" value="c"> C. <code>pi.provider</code></label>
+      <label class="opt"><input type="radio" name="q-2-9" value="d"> D. <code>pi.usage</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B — turn 是一次模型回复加其工具调用；run 是从输入到最终回答的所有轮。"
+         data-rationale="B 是 README 的定义。A 把两个词颠倒；C/D 无中生有 —— run 里可以有任意多轮。"
+         data-review="sec-submission">
+      <div class="prompt"><span class="qnum">Q10.</span> turn 和 run 的区别是？</div>
+      <label class="opt"><input type="radio" name="q-2-10" value="a"> A. turn 是一整个回答过程，run 是其中一轮</label>
+      <label class="opt"><input type="radio" name="q-2-10" value="b"> B. turn 是模型的一次回复加它的工具调用；run 是从一条输入到最终答案的全部轮次</label>
+      <label class="opt"><input type="radio" name="q-2-10" value="c"> C. turn 是工具执行，run 是模型请求</label>
+      <label class="opt"><input type="radio" name="q-2-10" value="d"> D. 完全同义</label>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测试</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测试</button>
+  </form>
+
+  <p style="margin-top:2rem; color:var(--muted);">
+    下一章：<a href="03-quick-start.html"><strong>第 3 章 — 第一个程序：Quick Start 逐行精读</strong></a>。
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 6 章 — Commit 深挖：Tx 与 Document</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ pi-durable 源码导读</a>
+  <span class="crumb">第 6 章 · Commit 深挖</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="6">
+<script>window.BOOK_CONFIG = { slug: "pi-durable", lang: "zh", chapters: [{n:1,slug:"01-what-and-why"},{n:2,slug:"02-core-concepts"},{n:3,slug:"03-quick-start"},{n:4,slug:"04-storage-and-resume"},{n:5,slug:"05-api-panorama"},{n:6,slug:"06-commit-and-documents"},{n:7,slug:"07-tasks"},{n:8,slug:"08-tools-and-env"},{n:9,slug:"09-extensions-and-agent"},{n:10,slug:"10-inbox-watch-errors"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 6 章 · 深潜之一</div>
+    <h1>Commit 深挖：Tx 事务面与 Document 文档系统</h1>
+    <p class="lede">
+      commit 是整个包的地基。本章回答四个问题：代码里到底有哪几个 commit 入口；
+      事务对象 Tx 上能做什么、不能做什么；为什么"回调里只准用 tx 读"；
+      以及文档（Document）这套类型化 JSON 状态怎么定义、怎么读、怎么在 fork 时表现。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能列出四个 commit 入口及其适用场景（宿主 / 会话 / 任务 / 工具）</li>
+      <li>能说出 Tx 的三类操作（读、写、文档）并各举两个方法</li>
+      <li>能解释 ReadAfterWrite 错误与"回调里禁止 Session 读"的原因</li>
+      <li>能用 defineDoc 写出带版本迁移的文档，并选对 scope / history / fork 语义</li>
+      <li>能区分 snapshot / snapshotAsOf / documentState / watchDoc 四种读法</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-commit-entries">6.1 四个 commit 入口</h2>
+  <p>同一台原子提交机器，有四个方向盘：</p>
+  <ul>
+    <li><strong><code>harness.commit(cb, context)</code></strong>（Session 继承，<code>src/types.ts:955</code>）— 宿主的裸提交线，不绑定会话。创建不归属任何会话的会话级文档、做全局记账时用。</li>
+    <li><strong><code>conversation.commit(cb, context)</code></strong>（<code>src/harness/harness.ts:124-126</code>）— 最常用。与裸提交的差别只有一处：其 <code>tx.createTask()</code> 默认归属该会话。</li>
+    <li><strong><code>runtime.commit(cb, context)</code></strong>（任务里，<code>src/types.ts:197-203</code>）— 任务专用：在 Session 线上提交，<strong>回调的返回值若是一个任务状态就同时替换本任务的状态</strong>（推进检查点 / 声明终态都在这一步）。第 7 章的主角。</li>
+    <li><strong><code>api.commit(cb, context)</code></strong>（工具里，<code>src/harness/types.ts:238</code>）— 工具执行中写条目/文档/建子任务用。同样是原子的。</li>
+  </ul>
+  <p>四个入口汇进同一条<strong>串行化的变更线</strong>：两个并发的 commit 不会交错，先到先得。这就是 spec 所说的 mutation line —— 所有原子性的根源。</p>
+
+  <h2 id="sec-tx-surface">6.2 Tx 表面：事务回调里能做什么</h2>
+  <p><code>Tx</code> 接口（<code>src/types.ts:791-886</code>）按用途分三组：</p>
+  <ul>
+    <li>
+      <strong>读</strong>（都是存储一致读）：
+      <code>conversation(id)</code> / <code>entry(id)</code>（含类型化重载）/ <code>task(id)</code>；
+      四个 scan：<code>scanConversations</code>、<code>scanEntries</code>、<code>scanTasks</code>、
+      <code>latestHeadMarker(conversationId)</code>；<code>submissionByRequest(conversationId, requestId)</code>。
+    </li>
+    <li>
+      <strong>写</strong>（随本 commit 落盘）：
+      <code>createConversation({ ownership })</code> / <code>forkConversation(parentId, at, { ownership })</code>；
+      <code>appendEntry(conversationId, draft)</code>（或带类型令牌版 <code>appendEntry(Token, conversationId, typedDraft)</code>）；
+      <code>createTask(task, input, options)</code>；
+      <code>createSubmission(create)</code> / <code>settleSubmission(id, settlement)</code> / <code>placeSubmission(id, entryId)</code>（后两个主要给实现接纳逻辑的内置代码用）。
+    </li>
+    <li>
+      <strong>文档</strong>：六个重载的 <code>doc(token, ...ownerId, ...key, seed)</code> 拿到可变 Draft 改完即提交；
+      <code>retireDoc(token, ...)</code> 退役一个文档。
+    </li>
+  </ul>
+  <p>一个组合小例（会话级配置 + 条目 + 任务一锅端）：</p>
+  <pre><code>await root.commit(async (tx) =&gt; {
+	const note = await tx.appendEntry(root.id, {
+		kind: "app.note",
+		data: { text: "切换前先记录" },
+	});
+	const todos = await tx.doc(Todos, root.id);   // Draft：直接改
+	todos.items.push(`note-${note.id}`);
+	if (todos.items.length &gt; 3) {
+		await tx.createTask(Cleanup, { since: note.id }, { ownership: { kind: "conversation" } });
+	}
+	return todos.items.length;                     // commit 的返回值
+}, context);</code></pre>
+
+  <div class="demo" data-demo="commitDemo">
+    <div class="demo-title">动手试 — 原子性：一次 commit 的生与死</div>
+    <p>
+      模拟一次 <code>conversation.commit(tx =&gt; ...)</code>：追加条目、改文档、建任务三件事打包。
+      切换到「中途抛异常」再跑，观察存储最终留下什么。
+    </p>
+    <label class="opt"><input type="radio" name="commit-mode" value="ok" checked> 三步全成功</label>
+    <label class="opt"><input type="radio" name="commit-mode" value="fail"> 第二步抛异常</label>
+    <br>
+    <button data-run>执行 commit</button>
+    <div class="demo-output empty">点按钮运行。</div>
+  </div>
+
+  <h2 id="sec-rules">6.3 三条事务规则</h2>
+  <ol>
+    <li>
+      <strong>回调抛异常 = 整个提交回滚。</strong>
+      不是"写到哪算哪"—— <code>storage.commit()</code> 根本不会被调用，
+      所有暂存写入作废。你的错误原样传播给 commit 的调用者。
+    </li>
+    <li>
+      <strong>写后读表 = <code>ReadAfterWrite</code>。</strong>
+      事务里一旦写了表（建会话、建任务这类"表记录"），<strong>再用 tx 读表</strong>会抛
+      <code>ReadAfterWrite</code>（导出自 <code>src/errors.ts</code>）。
+      这与实现方式有关：tx 的读走的是进入事务时的快照语义，写入还没落盘，读回来只会自欺欺人，
+      所以直接禁止。<strong>文档读写不受影响</strong> —— <code>tx.doc()</code> 之后继续读写文档没问题。
+      <code>ConversationInit</code> 的文档注释（<code>src/harness/types.ts:464-468</code>）就明说了：
+      建会话是表写，init 里读表会抛 ReadAfterWrite，文档访问照常。
+    </li>
+    <li>
+      <strong>回调里只准用 tx 读。</strong>
+      Session 自己的读方法（<code>snapshot()</code>、<code>getTask()</code> 等）会排队在
+      你这回调占着的提交线后面 —— <strong>永远排不到，死锁</strong>。
+      四个 commit 入口的文档注释都重复这句警告（如 <code>src/types.ts:953</code>）。
+      需要读，用 <code>tx</code>；实在要 Session 读，先结束这个 commit。
+    </li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="提交线串行化">
+      <text x="410" y="24" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">同一条提交线：并发 commit 串行执行</text>
+      <rect x="30" y="50" width="760" height="30" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="410" y="70" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">Session 变更线（串行，一次一个事务）</text>
+      <rect x="60" y="110" width="180" height="60" rx="8" style="fill:var(--surface);stroke:var(--pass)" stroke-width="2"/>
+      <text x="150" y="135" text-anchor="middle" style="fill:var(--fg)" font-size="11">commit A（宿主）</text>
+      <text x="150" y="155" text-anchor="middle" style="fill:var(--pass)" font-size="10">seq 41 落盘 ✓</text>
+      <rect x="260" y="110" width="180" height="60" rx="8" style="fill:var(--surface);stroke:var(--pass)" stroke-width="2"/>
+      <text x="350" y="135" text-anchor="middle" style="fill:var(--fg)" font-size="11">commit B（工具 api）</text>
+      <text x="350" y="155" text-anchor="middle" style="fill:var(--pass)" font-size="10">seq 42 落盘 ✓</text>
+      <rect x="460" y="110" width="180" height="60" rx="8" style="fill:var(--surface);stroke:var(--fail)" stroke-width="2"/>
+      <text x="550" y="135" text-anchor="middle" style="fill:var(--fg)" font-size="11">commit C（任务）</text>
+      <text x="550" y="155" text-anchor="middle" style="fill:var(--fail)" font-size="10">回调抛错 → 回滚</text>
+      <line x1="240" y1="140" x2="255" y2="140" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="260,140 250,135 250,145" style="fill:var(--muted)"/>
+      <line x1="440" y1="140" x2="455" y2="140" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="460,140 450,135 450,145" style="fill:var(--muted)"/>
+      <rect x="60" y="200" width="580" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="350" y="224" text-anchor="middle" style="fill:var(--warn)" font-size="11" font-weight="700">反例：commit C 的回调里调 harness.snapshot()</text>
+      <text x="350" y="244" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">snapshot 排在 C 占用的提交线后面 → 永远不返回（死锁）</text>
+      <text x="410" y="285" text-anchor="middle" style="fill:var(--muted)" font-size="11" font-style="italic">观察者在每个完整 Seq 后被唤醒；失败的事务不产生 Seq，谁也看不见它</text>
+    </svg>
+    <figcaption>串行提交线：成功的事务各得一个 Seq；失败的事务无痕消失；绕过 tx 直接读 Session 会自己锁死自己。</figcaption>
+  </figure>
+
+  <h2 id="sec-docs">6.4 Document：定义你自己的持久状态</h2>
+  <p>文档 = 会话/任务旁边的一块类型化 JSON 状态，只能在 commit 里改。定义用 <code>defineDoc()</code>（<code>src/documents.ts:39</code>）：</p>
+  <pre><code>import { defineDoc } from "@earendil-works/pi-durable";
+
+const Todos = defineDoc&lt;{ items: string[] }&gt;({
+	kind: "app.todos",      // 持久化种类名（协议的一部分，别改）
+	version: 1,             // 存储值形状的版本号（正整数）
+	scope: "conversation",  // 归属：session / conversation / task
+	history: "latest",      // conversation 专属：latest 只留当前值 / rewindable 可按历史读
+	fork: "initial",        // conversation 专属：fork 时继承 initial / current / asOf
+	initial: () =&gt; ({ items: [] }),
+	migrate: (value, fromVersion) =&gt; ({ ...value, items: value.items ?? [] }), // 可选
+});
+
+// 写（只能进 commit）：
+await root.commit((tx) =&gt; {
+	(await tx.doc(Todos, root.id)).items.push("写文档");
+}, context);
+
+// 读快照：
+console.log(await harness.snapshot(Todos, root.id, context));</code></pre>
+  <p>三个维度决定一个文档的行为：</p>
+  <ul>
+    <li><strong>scope</strong> — <code>session</code>（全局一份）、<code>conversation</code>（每会话一份）、<code>task</code>（每任务一份）。还有家族版 <code>defineDocFamily</code>：同一 scope 下按键（key）开多份，<code>initial(seed)</code> 只在成员缺席时运行。</li>
+    <li><strong>history</strong>（仅 conversation）— <code>latest</code> 只保留当前值，省空间；<code>rewindable</code> 保留历史，可用 <code>snapshotAsOf(token, conversationId, entryId)</code> 读"某条历史条目时点"的值 —— 分叉回放、审计都需要它。</li>
+    <li><strong>fork</strong>（仅 conversation）— 分叉时新会话拿到什么：<code>initial</code>（全新初始值）、<code>current</code>（父会话当前值）、<code>asOf</code>（分叉点时值，要求 rewindable）。</li>
+  </ul>
+  <p>
+    写入细节：你对 Draft 的修改被 diff 成增量（delta ops）存储，存储层偶尔按
+    <code>checkpointWhen</code> 的判断写完整基线（base），<strong>崩溃只可能丢"还没提交的"，
+    已提交的增量链永远自洽</strong>。版本升级：调高 <code>version</code> 并提供
+    <code>migrate(value, fromVersion)</code>，旧值在读取时被迁移。忘了写 migrate 而存着旧版本，
+    类型化访问会抛错提醒你。
+  </p>
+
+  <h2 id="sec-doc-reads">6.5 四种读法</h2>
+  <ul>
+    <li><code>harness.snapshot(token, ...)</code> — 一次性读当前值（<code>Readonly&lt;T&gt; | undefined</code>）。请求-响应式代码用。</li>
+    <li><code>harness.snapshotAsOf(token, conversationId, at, context)</code> — 读 rewindable 文档在历史某条目时点的值。</li>
+    <li><code>harness.documentState(token, ...)</code> — 拿一个<strong>可订阅的状态对象</strong>（Chord 的 AttachedReplicatedState）：后续提交自动推进，UI 直接订阅。</li>
+    <li><code>harness.watchDoc(token, ...)</code> — 拿<strong>逐帧的精确观察</strong>（带增量 ops 的 watch handle），做同步器/远端镜像时用。</li>
+  </ul>
+  <p>选择口径：偶尔读用 snapshot；界面常驻用 documentState；要把变更精确传给另一个进程/客户端用 watchDoc。第 10 章的会话级 viewState / watch 是这些原语在"整份会话视图"上的组合。</p>
+
+  <h2 id="sec-recap">6.6 本章回顾</h2>
+  <ul>
+    <li>四个 commit 入口共用一条串行提交线；Conversation.commit 的 tx.createTask 默认归属该会话。</li>
+    <li>Tx 三组操作：读（scan/单查）、写（建会话/条目/任务/提交）、文档（doc/retireDoc）。</li>
+    <li>三条规则：回调抛错全回滚；表写后读表抛 ReadAfterWrite（文档不受限）；回调里禁止 Session 读（会死锁），只准用 tx。</li>
+    <li>文档三维度：scope（session/conversation/task + family）、history（latest/rewindable）、fork（initial/current/asOf）；版本靠 migrate 升级。</li>
+    <li>读法四件套：snapshot / snapshotAsOf / documentState / watchDoc。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>在 init / conversationCreated 回调里 tx.scanConversations(...) —— 建会话是表写，随后读表抛 ReadAfterWrite；要读文档或改用创建返回的 record。</li>
+      <li>commit 回调里图方便调 harness.snapshot —— 死锁。用 tx。</li>
+      <li>改了文档形状却不动 version —— 旧数据按旧形状读出新代码，炸在远方。version + migrate 成对出现。</li>
+      <li>以为 Draft 是拷贝 —— 它就是本次事务里的文档本体，改完即提交，别缓存它跨事务使用。</li>
+      <li>用 latest 文档却想读历史值 —— 需要 rewindable + snapshotAsOf，latest 根本没存历史。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="6">
+    <h2>第 6 章测试</h2>
+
+    <div class="q" data-id="6-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C — 在 tx.createTask 的默认归属上：Conversation 版默认归属该会话。"
+         data-rationale="C 正确（harness.ts:124 的实现把 conversationId 传给 commitWith）。两者其余行为一致；A/B/D 都是不实差异。"
+         data-review="sec-commit-entries">
+      <div class="prompt"><span class="qnum">Q1.</span> <code>harness.commit()</code> 与 <code>conversation.commit()</code> 的实际差别是？</div>
+      <label class="opt"><input type="radio" name="q-6-1" value="a"> A. 前者不支持追加条目</label>
+      <label class="opt"><input type="radio" name="q-6-1" value="b"> B. 后者会自动开启调度器</label>
+      <label class="opt"><input type="radio" name="q-6-1" value="c"> C. 后者的 tx.createTask() 默认归属该会话</label>
+      <label class="opt"><input type="radio" name="q-6-1" value="d"> D. 前者不是原子的</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-2" data-type="mcq" data-correct='["b"]'
+         data-answer="B — ReadAfterWrite：表写之后再读表会被拒绝（文档读写不受影响）。"
+         data-rationale="B 正确。A 不是专门的错；C 不会发生 —— 恰恰禁止读；D 与取消无关。"
+         data-review="sec-rules">
+      <div class="prompt"><span class="qnum">Q2.</span> 事务回调里 <code>tx.createConversation()</code> 之后又调 <code>tx.scanConversations()</code>，结果是？</div>
+      <label class="opt"><input type="radio" name="q-6-2" value="a"> A. 读到刚建的会话</label>
+      <label class="opt"><input type="radio" name="q-6-2" value="b"> B. 抛 ReadAfterWrite</label>
+      <label class="opt"><input type="radio" name="q-6-2" value="c"> C. 返回空页</label>
+      <label class="opt"><input type="radio" name="q-6-2" value="d"> D. 事务自动回滚但不报错</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-3" data-type="mcq" data-correct='["d"]'
+         data-answer="D — 死锁：Session 读排队在这条回调占用的提交线后面，永远不返回。"
+         data-rationale="D 正确，四个 commit 入口的文档注释都写了这句。A/B/C 都低估了后果。"
+         data-review="sec-rules">
+      <div class="prompt"><span class="qnum">Q3.</span> 在 commit 回调里调用 <code>harness.snapshot(...)</code> 会怎样？</div>
+      <label class="opt"><input type="radio" name="q-6-3" value="a"> A. 正常返回最新值</label>
+      <label class="opt"><input type="radio" name="q-6-3" value="b"> B. 返回旧值</label>
+      <label class="opt"><input type="radio" name="q-6-3" value="c"> C. 抛 ReadAfterWrite</label>
+      <label class="opt"><input type="radio" name="q-6-3" value="d"> D. 挂起不返回（提交线被回调占住）</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-4" data-type="mcq" data-multiselect="true" data-correct='["b","c"]'
+         data-answer="B、C。"
+         data-rationale="history 和 fork 是 conversation 专属字段（DocumentSemantics，types.ts:42-60）。scope/kind/version 是所有文档共有的；seed 属于 family。"
+         data-review="sec-docs">
+      <div class="prompt"><span class="qnum">Q4.</span> 以下哪些字段是 <strong>conversation scope 文档专属</strong>的语义维度？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-6-4" value="a"> A. kind 与 version</label>
+      <label class="opt"><input type="checkbox" name="q-6-4" value="b"> B. history（latest / rewindable）</label>
+      <label class="opt"><input type="checkbox" name="q-6-4" value="c"> C. fork（initial / current / asOf）</label>
+      <label class="opt"><input type="checkbox" name="q-6-4" value="d"> D. scope 本身</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-5" data-type="mcq" data-correct='["a"]'
+         data-answer="A — snapshotAsOf(token, conversationId, entryId)：读 rewindable 文档在历史某条目时点的值。"
+         data-rationale="A 正确。B 没有 at 参数；C 是订阅当前值；D 是逐帧观察，都不是历史读。"
+         data-review="sec-doc-reads">
+      <div class="prompt"><span class="qnum">Q5.</span> 审计功能要读"分叉点上"的文档值，用哪个 API？</div>
+      <label class="opt"><input type="radio" name="q-6-5" value="a"> A. <code>snapshotAsOf(token, conversationId, at, context)</code></label>
+      <label class="opt"><input type="radio" name="q-6-5" value="b"> B. <code>snapshot(token, conversationId, context)</code></label>
+      <label class="opt"><input type="radio" name="q-6-5" value="c"> C. <code>documentState(token, conversationId, context)</code></label>
+      <label class="opt"><input type="radio" name="q-6-5" value="d"> D. <code>watchDoc(token, conversationId, context)</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-6" data-type="fill" data-accepted='["migrate"]'
+         data-answer="migrate"
+         data-rationale="版本升级：调高 version 并提供 migrate(value, fromVersion)，旧值在读取时被迁移；缺 migrate 的旧版本访问会抛错。"
+         data-review="sec-docs">
+      <div class="prompt"><span class="qnum">Q6.</span> 填空：文档的 version 从 1 升到 2 时，必须提供 <code>______</code> 来转换旧存量值。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-7" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Draft：可变草稿，改完随本次提交落盘（存为增量）。"
+         data-rationale="B 正确。A/C/D 都误判了 tx.doc 的性质；文档读取的正确姿势是 commit 外的 snapshot 系列。"
+         data-review="sec-tx-surface">
+      <div class="prompt"><span class="qnum">Q7.</span> <code>tx.doc(Todos, conversationId)</code> 返回什么？</div>
+      <label class="opt"><input type="radio" name="q-6-7" value="a"> A. 不可变快照，改了也不生效</label>
+      <label class="opt"><input type="radio" name="q-6-7" value="b"> B. 可变的 Draft，在事务内直接修改，随 commit 落盘</label>
+      <label class="opt"><input type="radio" name="q-6-7" value="c"> C. 一个 promise，resolve 后才是文档</label>
+      <label class="opt"><input type="radio" name="q-6-7" value="d"> D. 文档定义本身</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C — checkpointWhen：返回 true 时这次普通变更存成完整基线而非增量。"
+         data-rationale="C 正确（CommonDocDefinition，types.ts:77）。A 是版本迁移；B 不存在；D 与存储无关。"
+         data-review="sec-docs">
+      <div class="prompt"><span class="qnum">Q8.</span> 想控制"增量链过长时写一份完整基线"，应该配置文档定义的哪个字段？</div>
+      <label class="opt"><input type="radio" name="q-6-8" value="a"> A. migrate</label>
+      <label class="opt"><input type="radio" name="q-6-8" value="b"> B. fork</label>
+      <label class="opt"><input type="radio" name="q-6-8" value="c"> C. checkpointWhen</label>
+      <label class="opt"><input type="radio" name="q-6-8" value="d"> D. initial</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-9" data-type="mcq" data-correct='["b"]'
+         data-answer="B — conversation.commit：绑定会话且 tx.createTask 默认归属它，正是给会话挂任务的入口。"
+         data-rationale="B 正确。A 也可用但要显式传 conversationId；C 是任务内部推进自身状态的入口；D 是会话级文档。"
+         data-review="sec-commit-entries">
+      <div class="prompt"><span class="qnum">Q9.</span> 宿主代码想给会话 c 挂一个顶层任务（会话拥有），最顺手的入口是？</div>
+      <label class="opt"><input type="radio" name="q-6-9" value="a"> A. harness.commit 里 tx.createTask(..., { conversationId: c.id, ownership: ... })</label>
+      <label class="opt"><input type="radio" name="q-6-9" value="b"> B. c.commit 里 tx.createTask(..., { ownership: { kind: "conversation" } })</label>
+      <label class="opt"><input type="radio" name="q-6-9" value="c"> C. runtime.commit</label>
+      <label class="opt"><input type="radio" name="q-6-9" value="d"> D. 不可能，只有内置代码能建任务</label>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测试</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测试</button>
+  </form>
+
+  <p style="margin-top:2rem; color:var(--muted);">
+    下一章：<a href="07-tasks.html"><strong>第 7 章 — Task：持久状态机与所有权</strong></a>。
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

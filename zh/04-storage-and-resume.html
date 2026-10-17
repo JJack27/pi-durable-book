@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 4 章 — 持久化与恢复：四种存储后端</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ pi-durable 源码导读</a>
+  <span class="crumb">第 4 章 · 存储与恢复</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="4">
+<script>window.BOOK_CONFIG = { slug: "pi-durable", lang: "zh", chapters: [{n:1,slug:"01-what-and-why"},{n:2,slug:"02-core-concepts"},{n:3,slug:"03-quick-start"},{n:4,slug:"04-storage-and-resume"},{n:5,slug:"05-api-panorama"},{n:6,slug:"06-commit-and-documents"},{n:7,slug:"07-tasks"},{n:8,slug:"08-tools-and-env"},{n:9,slug:"09-extensions-and-agent"},{n:10,slug:"10-inbox-watch-errors"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 4 章 · 持久化</div>
+    <h1>持久化与恢复：换掉 MemoryStorage，进程死了也能续</h1>
+    <p class="lede">
+      第 3 章的程序一退出就什么都没了，因为用的是 MemoryStorage。本章换上真正的后端，
+      讲清崩溃后重开时到底发生什么、怎么保证不重复提交、以及四个后端各自的取舍。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能写出 SQLite 版的最小"重开续跑"程序（open → root → resume）</li>
+      <li>能说明 <code>resume()</code> 做什么、哪些调用会隐式启动调度器</li>
+      <li>能用 <code>requestId</code> 与 <code>harness.submission(id)</code> 写出崩溃安全的提交重试</li>
+      <li>能按场景选后端：Memory / SQLite / JSONL / Cloudflare Durable Object，并说出各自的关键限制</li>
+      <li>能解释 <code>pi.provider</code> 里的持久 sessionId 为什么能保温提供商 prompt 缓存</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-backends">4.1 四个后端一张表</h2>
+  <p>README 的存储表格（<code>README.md:664-669</code>）浓缩如下：</p>
+  <ul>
+    <li><strong>Memory</strong> — <code>MemoryStorage</code>（包根导出）。什么都不持久化，测试与教学用。</li>
+    <li><strong>SQLite</strong> — <code>openNodeSqliteStorage(file)</code>（<code>@earendil-works/pi-durable/storage/sqlite/node</code>）。一个数据库文件；WAL 模式 + <code>synchronous = NORMAL</code>：<strong>提交能扛住进程崩溃；断电/宿主机故障可能丢最新一条</strong>。长跑智能体的默认选择。</li>
+    <li><strong>JSONL</strong> — <code>openNodeJsonlStorage(directory, context)</code>（<code>/storage/jsonl/node</code>）。一个目录里的追加式文件；<code>{ fsync: true }</code> 可在每条提交标记前刷盘。整个历史也留在内存里，<strong>内存随历史增长</strong> —— 适合短期任务，长跑用 SQLite。</li>
+    <li><strong>Cloudflare Durable Object</strong> — <code>openDurableObjectSqliteStorage(ctx.storage)</code>（<code>/storage/sqlite/cloudflare</code>）。一个 SQLite 型 Durable Object 的存储；提交即其存储事务。</li>
+  </ul>
+  <p>两条全局规则（<code>README.md:677</code> 与 spec §10）：</p>
+  <ul>
+    <li><strong>一个进程独占一个存储</strong>：没有跨进程锁。两个进程同时打开同一 SQLite 文件是不受支持的用法。</li>
+    <li>可移植内核（<code>/storage/sqlite</code>、<code>/storage/jsonl</code>）不依赖 Node API —— 给它们一个异步 <code>SqliteDatabase</code> 门面或 env 包里的 <code>FileSystem</code>，就能在 Bun、Cloudflare 上跑。</li>
+  </ul>
+
+  <h2 id="sec-resume">4.2 重开与 resume()：断点在哪</h2>
+  <p>把第 3 章的程序换成 SQLite，就得到跨进程版本（<code>README.md:107-113</code>）：</p>
+  <pre><code>import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+
+const harness = await Harness.open(
+	await openNodeSqliteStorage("./session.sqlite"),
+	{ models, registry },
+	context,
+);
+const root = await harness.root(context); // 和上次是同一个根会话
+harness.resume();                          // 继续上个进程没做完的 run</code></pre>
+  <p>重开时发生的两件事：</p>
+  <ol>
+    <li><strong>对账</strong>：打开存储时把幸存的 <code>running</code> 任务改回 <code>pending</code>（<code>src/harness/harness.ts:252-255</code> 的 <code>openTasks</code>）。因为"running"只表示被某个存活进程的调用占用，那个进程死了，任务自然回到可调度状态，并带着它最后的检查点。</li>
+    <li><strong>调度</strong>：<code>resume()</code> 启动任务调度器。不调也行 —— 任何"要进度"的调用都会隐式启动它：<code>submit()</code>、<code>compact()</code>、<code>abort()</code>、<code>Submission.wait()</code>、<code>waitForTask()</code>、两个 <code>waitForIdle()</code>（<code>src/harness/types.ts:715-719</code>）。<strong>只读的观看者永远不会启动调度</strong> —— 一个纯 UI 进程可以打开存储看而不干活。</li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="崩溃重开时序">
+      <text x="410" y="24" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">崩溃与重开：任务从检查点续跑</text>
+      <rect x="30" y="45" width="360" height="120" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="210" y="68" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">进程 A（死了）</text>
+      <rect x="55" y="82" width="310" height="26" rx="5" style="fill:var(--surface);stroke:var(--pass)"/>
+      <text x="210" y="100" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">commit：pi.tool 任务 running，检查点=已执行前 3 步</text>
+      <line x1="55" y1="122" x2="365" y2="122" style="stroke:var(--fail)" stroke-width="2" stroke-dasharray="6 4"/>
+      <text x="210" y="142" text-anchor="middle" style="fill:var(--fail)" font-size="11" font-weight="700">✕ 进程死亡（检查点已落盘）</text>
+      <text x="210" y="158" text-anchor="middle" style="fill:var(--muted)" font-size="10">外部效果（如 npm test）可能做了一半 —— 由 replay 策略管（第 8 章）</text>
+      <line x1="210" y1="165" x2="210" y2="190" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="210,197 204,187 216,187" style="fill:var(--muted)"/>
+      <rect x="30" y="200" width="360" height="90" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="210" y="223" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">进程 B：Harness.open(同一个库)</text>
+      <rect x="55" y="234" width="310" height="24" rx="5" style="fill:var(--surface);stroke:var(--muted)"/>
+      <text x="210" y="251" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">对账：running → pending（带原检查点）</text>
+      <rect x="55" y="262" width="310" height="24" rx="5" style="fill:var(--surface);stroke:var(--pass)"/>
+      <text x="210" y="279" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">resume() → 调度器从检查点继续，不重放已完成步骤</text>
+      <rect x="420" y="60" width="370" height="230" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="605" y="85" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">session.sqlite（完好）</text>
+      <rect x="445" y="100" width="320" height="26" rx="5" style="fill:var(--surface);stroke:var(--muted)"/>
+      <text x="605" y="118" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">条目 … pi.user → pi.assistant(tool calls)</text>
+      <rect x="445" y="134" width="320" height="26" rx="5" style="fill:var(--surface);stroke:var(--warn)"/>
+      <text x="605" y="152" text-anchor="middle" style="fill:var(--warn)" font-size="10">任务 pi.tool：pending + 检查点（第 3 步后）</text>
+      <rect x="445" y="168" width="320" height="26" rx="5" style="fill:var(--surface);stroke:var(--muted)"/>
+      <text x="605" y="186" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">submission：placed（等待回答）</text>
+      <text x="605" y="215" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">WAL + synchronous=NORMAL：</text>
+      <text x="605" y="233" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">进程崩溃不丢已确认提交；</text>
+      <text x="605" y="251" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">断电可能丢最新一条</text>
+      <text x="605" y="278" text-anchor="middle" style="fill:var(--muted)" font-size="10" font-style="italic">同一时刻只允许一个进程打开</text>
+    </svg>
+    <figcaption>崩溃留下的不是废墟而是现场：条目、带检查点的 pending 任务、placed 状态的提交，重开后各就各位。</figcaption>
+  </figure>
+
+  <h2 id="sec-idempotent">4.3 崩溃安全的提交：requestId 幂等</h2>
+  <p>
+    场景：你的服务收到用户消息，调 <code>submit()</code>，网络超时了。客户端重试 —— 会不会问两遍？
+    不会，只要带同一个 <code>requestId</code>（<code>README.md:117-126</code>）：
+  </p>
+  <pre><code>const s1 = await root.submit(
+	{ type: "input", content: "Hello", requestId: "greeting-1" }, context);
+// 进程重启后，用同一个 requestId 再提交：
+const again = await root.submit(
+	{ type: "input", content: "Hello", requestId: "greeting-1" }, context);
+// again.id === s1.id —— 拿回的是同一个 submission，而不是新的</code></pre>
+  <p>
+    去重是<strong>会话范围内</strong>的（<code>SubmissionRecord.requestId</code> 的注释：
+    "Host-provided deduplication key, scoped to the conversation"，<code>src/types.ts:376</code>）。
+    如果重启后你手里有上次的 submission ID，也可以直接 <code>harness.submission(id, context)</code>
+    重新拿回等待句柄 —— 这就是"重开进程后接着等答案"的完整写法。
+  </p>
+
+  <h2 id="sec-provider-identity">4.4 pi.provider：不变的会话身份</h2>
+  <p>
+    每个会话在 <code>pi.provider</code> 文档里持有一个 UUIDv7。它被转发给 pi-ai 作为
+    <code>sessionId</code>，提供商拿它做 prompt 缓存与会话亲和。关键性质：<strong>重开、重试、
+    reset、压缩、换模型都不换身份</strong>；<strong>子会话与分叉拿全新身份</strong>。
+    这解释了一个反直觉的好性质：哪怕经历了上下文压缩，提供商仍然认得这是同一个会话，
+    缓存命中率不因为内部操作而清零。
+  </p>
+
+  <h2 id="sec-sharing">4.5 与宿主共享数据库：前缀与适配器</h2>
+  <p>两个进阶点，用到再查即可：</p>
+  <ul>
+    <li><strong>表前缀</strong>：三个 SQLite 入口都收 <code>{ prefix: "pi_" }</code>，把表和索引圈进自己的命名空间，可与宿主表共库。前缀须是合法 SQLite 标识符、不能以 <code>sqlite_</code> 开头；改前缀不做数据迁移。</li>
+    <li><strong>Cloudflare 共库</strong>：同一 storage 对象打开的多个 Pi 存储自动共享操作队列；宿主自己的表查询要走同一个适配器（<code>DurableObjectSqliteDatabase</code>），绕开队列直连存储可能被 Pi 的事务回滚。</li>
+  </ul>
+  <p>
+    自定义后端有官方一致性测试套件：<code>registerStorageConformance()</code>
+    （<code>@earendil-works/pi-durable/testing</code>），任何 Vitest/Jest 兼容的 runner 都能跑。
+    适配器契约（<code>README.md:690-697</code>）：promise 风格的 <code>exec / run / get / all /
+    transaction / close</code>，事务回调里只能用传入的事务句柄。
+  </p>
+
+  <h2 id="sec-recap">4.6 本章回顾</h2>
+  <ul>
+    <li>SQLite 是长跑默认：WAL + NORMAL，扛进程崩溃，断电可能丢最新一条；JSONL 简单但内存随历史涨；Memory 不持久；DO 面向 Cloudflare。</li>
+    <li>重开 = 对账（running→pending，带着检查点）+ 可选 resume()；只读观察者不触发调度。</li>
+    <li>同 requestId 重试拿回同一 submission（会话内去重）；<code>harness.submission(id)</code> 重获等待句柄。</li>
+    <li><code>pi.provider</code> 的 UUIDv7 跨一切内部操作稳定，保住提供商缓存亲和；分叉/子会话另起身份。</li>
+    <li>一库一进程；共享库用前缀或统一适配器；自定义后端跑 conformance 套件。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>两个进程开同一个 SQLite 文件 —— 没有跨进程锁，行为未定义。</li>
+      <li>期待断电级持久 —— 默认配置承诺的是进程崩溃级；要更强需 JSONL + fsync 或调存储配置。</li>
+      <li>重试 submit 不带 requestId —— 会真的提交两次。</li>
+      <li>以为 resume() 必须显式调用 —— 大多数"要进度"的调用都会启动调度器；反之纯观看进程不会误启动。</li>
+      <li>长跑服务用 JSONL —— 历史全驻内存，越跑越胖，换 SQLite。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="4">
+    <h2>第 4 章测试</h2>
+
+    <div class="q" data-id="4-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — 对账：把幸存的 running 任务改回 pending（带原检查点），供调度器续跑。"
+         data-rationale="B 正确（openTasks，src/harness/harness.ts:252）。A 与不可变设计矛盾；C 没有跨进程协作机制；D 只对声明 replay:safe 的工具成立，且发生在其重新执行时。"
+         data-review="sec-resume">
+      <div class="prompt"><span class="qnum">Q1.</span> <code>Harness.open()</code> 重开一个有未完成工作的存储时，对 running 状态的任务做什么？</div>
+      <label class="opt"><input type="radio" name="q-4-1" value="a"> A. 回滚它们产生的所有条目</label>
+      <label class="opt"><input type="radio" name="q-4-1" value="b"> B. 改回 pending，保留最后的检查点，等待再次调度</label>
+      <label class="opt"><input type="radio" name="q-4-1" value="c"> C. 让另一个进程继续执行它们</label>
+      <label class="opt"><input type="radio" name="q-4-1" value="d"> D. 自动按 replay 策略重新执行</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C — 只读的观看者（viewState/watch/watchEvents）不会启动调度。"
+         data-rationale="C 正确：文档明确只读观看者不启动调度（Read-only viewers never do）。A/B/D 全都是会隐式启用调度的调用（types.ts:715-719）。"
+         data-review="sec-resume">
+      <div class="prompt"><span class="qnum">Q2.</span> 以下哪个调用<strong>不会</strong>隐式启动任务调度器？</div>
+      <label class="opt"><input type="radio" name="q-4-2" value="a"> A. <code>conversation.submit()</code></label>
+      <label class="opt"><input type="radio" name="q-4-2" value="b"> B. <code>submission.wait()</code></label>
+      <label class="opt"><input type="radio" name="q-4-2" value="c"> C. <code>conversation.viewState()</code></label>
+      <label class="opt"><input type="radio" name="q-4-2" value="d"> D. <code>harness.waitForIdle()</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-3" data-type="mcq" data-correct='["b"]'
+         data-answer="B — again.id === submission.id：同一会话内 requestId 命中既有提交。"
+         data-rationale="B 正确：requestId 是会话范围的去重键。A 会造成重复回答；C/D 与去重机制矛盾。"
+         data-review="sec-idempotent">
+      <div class="prompt"><span class="qnum">Q3.</span> 重启后用同一个 <code>requestId</code> 再次 <code>submit()</code>，结果是？</div>
+      <label class="opt"><input type="radio" name="q-4-3" value="a"> A. 抛 ConversationBusy</label>
+      <label class="opt"><input type="radio" name="q-4-3" value="b"> B. 返回既有的那个 submission（ID 相同）</label>
+      <label class="opt"><input type="radio" name="q-4-3" value="c"> C. 新建第二个 submission，模型回答两遍</label>
+      <label class="opt"><input type="radio" name="q-4-3" value="d"> D. 返回 undefined</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-4" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A/B/D 正确：跨进程续跑、单文件、进程崩溃级持久（WAL+NORMAL）。C 错：整个历史驻内存是 JSONL 的特性，SQLite 不是。"
+         data-review="sec-backends">
+      <div class="prompt"><span class="qnum">Q4.</span> 为长期运行的编程智能体选 SQLite 后端的理由？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-4-4" value="a"> A. 重开进程能续跑未完成的任务</label>
+      <label class="opt"><input type="checkbox" name="q-4-4" value="b"> B. 单数据库文件，运维简单</label>
+      <label class="opt"><input type="checkbox" name="q-4-4" value="c"> C. 它把整个历史保存在内存里以加速</label>
+      <label class="opt"><input type="checkbox" name="q-4-4" value="d"> D. 进程崩溃不丢已确认的提交（WAL + synchronous=NORMAL）</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D — 断电或宿主机故障可能丢最新一条提交。"
+         data-rationale="D 正确：NORMAL 级的取舍是进程崩溃安全、断电可能丢最新。A/B/C 夸大了损失范围。"
+         data-review="sec-backends">
+      <div class="prompt"><span class="qnum">Q5.</span> SQLite 后端在<strong>断电</strong>（非进程崩溃）时的承诺是？</div>
+      <label class="opt"><input type="radio" name="q-4-5" value="a"> A. 绝不丢任何提交</label>
+      <label class="opt"><input type="radio" name="q-4-5" value="b"> B. 丢最近一小时提交</label>
+      <label class="opt"><input type="radio" name="q-4-5" value="c"> C. 整个库损坏</label>
+      <label class="opt"><input type="radio" name="q-4-5" value="d"> D. 可能丢失最新一条提交；其余完好</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-6" data-type="mcq" data-correct='["a"]'
+         data-answer="A — 子会话与分叉获得全新的 provider 身份。"
+         data-rationale="A 正确：fork 与任务拥有的子会话都拿新 UUIDv7。B/C/D 列出的操作都刻意保持身份不变，以维持缓存亲和。"
+         data-review="sec-provider-identity">
+      <div class="prompt"><span class="qnum">Q6.</span> 以下哪种情况会话会获得<strong>新的</strong> provider sessionId（pi.provider）？</div>
+      <label class="opt"><input type="radio" name="q-4-6" value="a"> A. fork 出分叉，或创建任务拥有的子会话</label>
+      <label class="opt"><input type="radio" name="q-4-6" value="b"> B. 进程重开存储</label>
+      <label class="opt"><input type="radio" name="q-4-6" value="c"> C. 会话经历一次 compaction</label>
+      <label class="opt"><input type="radio" name="q-4-6" value="d"> D. 给会话换模型</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-7" data-type="fill" data-accepted='["1","一个进程","单进程","一个"]'
+         data-answer="一个进程（同一时刻只允许一个进程打开一个存储）"
+         data-rationale="没有跨进程锁；一个存储同一时刻属于一个进程。"
+         data-review="sec-backends">
+      <div class="prompt"><span class="qnum">Q7.</span> 填空：pi-durable 的存储没有跨进程锁，同一时刻允许 <code>______</code> 个进程打开同一个存储。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-8" data-type="mcq" data-correct='["b"]'
+         data-answer="B — registerStorageConformance()，来自 @earendil-works/pi-durable/testing。"
+         data-rationale="B 正确。A 是环境（env）的一致性套件；C/D 不存在。"
+         data-review="sec-sharing">
+      <div class="prompt"><span class="qnum">Q8.</span> 你写了一个自定义存储后端，官方提供的一致性验证工具是？</div>
+      <label class="opt"><input type="radio" name="q-4-8" value="a"> A. <code>registerEnvConformance()</code></label>
+      <label class="opt"><input type="radio" name="q-4-8" value="b"> B. <code>registerStorageConformance()</code></label>
+      <label class="opt"><input type="radio" name="q-4-8" value="c"> C. <code>assertStorageOk()</code></label>
+      <label class="opt"><input type="radio" name="q-4-8" value="d"> D. <code>benchmarkStorage()</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测试</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测试</button>
+  </form>
+
+  <p style="margin-top:2rem; color:var(--muted);">
+    下一章：<a href="05-api-panorama.html"><strong>第 5 章 — Harness 与 Conversation：API 全景</strong></a>。
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

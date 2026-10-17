@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 3 章 — 第一个程序：Quick Start 逐行精读</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ pi-durable 源码导读</a>
+  <span class="crumb">第 3 章 · Quick Start</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="3">
+<script>window.BOOK_CONFIG = { slug: "pi-durable", lang: "zh", chapters: [{n:1,slug:"01-what-and-why"},{n:2,slug:"02-core-concepts"},{n:3,slug:"03-quick-start"},{n:4,slug:"04-storage-and-resume"},{n:5,slug:"05-api-panorama"},{n:6,slug:"06-commit-and-documents"},{n:7,slug:"07-tasks"},{n:8,slug:"08-tools-and-env"},{n:9,slug:"09-extensions-and-agent"},{n:10,slug:"10-inbox-watch-errors"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 3 章 · 上手</div>
+    <h1>第一个程序：Quick Start 逐行精读</h1>
+    <p class="lede">
+      本章把 README 的 Quick Start 十几行代码逐行拆开。读完你能独立写出"问一个问题、拿到回答、
+      打印出来"的完整程序，并且明白每个调用在存储里留下了什么。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能默写 Quick Start 的骨架：open → root → submit → wait → commit → close</li>
+      <li>能说出 <code>Harness.open()</code> 对 registry 做的校验，以及忘了 <code>createRegistry()</code> 会怎样</li>
+      <li>能解释最后一行 commit 里 <code>tx.entry(AssistantEntry, ...)</code> 为什么是"读"而不是"写"</li>
+      <li>知道怎么在仓库里跑现成示例（faux provider 与真实 OpenAI 的差别）</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-code">3.1 完整代码</h2>
+  <p>以下与 <code>packages/durable/README.md:48-69</code> 一致（注释为本书所加）：</p>
+  <pre><code>import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { createModels } from "@earendil-works/pi-ai/models";
+import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
+import { AssistantEntry, createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
+
+const context = BACKGROUND_CONTEXT;                      // ① 永不取消的上下文
+
+const models = createModels();
+models.setProvider(openaiProvider());                    // ② 模型目录：读 OPENAI_API_KEY
+
+const harness = await Harness.open(                      // ③ 打开一个 Harness
+	new MemoryStorage(),                                  //    内存存储：进程结束即消失
+	{ models, registry: createRegistry() },               //    模型目录 + 扩展注册表
+	context,
+);
+const root = await harness.root(context, {               // ④ 根会话（首次调用时创建）
+	agent: { model: { provider: "openai", modelId: "gpt-6-sol" } },
+});
+
+const submission = await root.submit(                    // ⑤ 持久接纳一条用户输入
+	{ type: "input", content: "What is the capital of France?" },
+	context,
+);
+const settled = await submission.wait(context);          // ⑥ 等它被回答
+if (settled.status === "done" && settled.type === "input") {
+	const answer = await root.commit(                    // ⑦ 用一次事务读取答案条目
+		(tx) => tx.entry(AssistantEntry, settled.answer),
+		context,
+	);
+	console.log(answer?.model?.[0]);                     //    打印 AssistantMessage
+}
+await harness.close(context);                            // ⑧ 收摊</code></pre>
+
+  <h2 id="sec-lines">3.2 逐行精读</h2>
+
+  <p><strong>① <code>BACKGROUND_CONTEXT</code></strong> —— Chord 的取消上下文，永不触发取消。
+  pi-durable 里每个异步 API 的最后一个参数都是 <code>Context</code>。真实产品里你会传能取消的
+  context（比如绑定到 HTTP 请求的生命周期）；这里为了示例从简。</p>
+
+  <p><strong>② 模型目录</strong> —— pi-durable 不自己认识 OpenAI。<code>createModels()</code>
+  建 pi-ai 的目录对象，<code>setProvider(openaiProvider())</code> 注册 OpenAI 提供商（凭据从
+  <code>OPENAI_API_KEY</code> 环境变量读）。这个对象之后交给 Harness，所有模型请求（生成、压缩摘要）
+  都经它发出。</p>
+
+  <p><strong>③ <code>Harness.open(storage, options, context)</code></strong> —— 打开存储并启动机械。
+  实现在 <code>src/harness/harness.ts:460-485</code>，有一个值得记住的启动校验
+  （<code>harness.ts:468-473</code>）：它会检查注册表里内置任务（<code>pi.generation</code>、
+  <code>pi.tool</code>、<code>pi.compaction</code>）是否齐备，缺了就抛
+  <em>"Registry lacks built-in tasks …; create it with createRegistry()"</em>。
+  也就是说 <strong>registry 必须用 <code>createRegistry()</code> 建</strong> —— 它预装了内置任务。
+  <code>MemoryStorage</code> 让一切留在内存：学习用最合适，第 4 章换成 SQLite 就能跨进程。</p>
+
+  <p><strong>④ <code>harness.root(context, { agent })</code></strong> —— 拿根会话。
+  存储里还没有根会话时，这一次调用<strong>在一个 commit 里</strong>创建它并应用 <code>agent</code>
+  变更（<code>src/harness/harness.ts:356-373</code> 的 <code>#create</code>）：写入空的
+  <code>pi.live / pi.inbox / pi.usage</code>、新的 <code>pi.provider</code> 身份、以及含模型选择的
+  <code>pi.agent</code>。再次调用直接返回已有的根（ID 恒为 1）。</p>
+
+  <p><strong>⑤ <code>root.submit({ type: "input", content }, context)</code></strong> ——
+  持久接纳输入。<code>submit()</code> 返回一个可等待的 <code>Submission</code> 对象。
+  "接纳"（admit）意味着<strong>输入已被原子提交进存储</strong>（一条 <code>pi.user</code> 条目 +
+  一条提交记录），此刻哪怕进程死掉，重开后它仍在。接下来内置的 generation 任务接手：调模型、
+  把回答写为 <code>pi.assistant</code> 条目。</p>
+
+  <p><strong>⑥ <code>submission.wait(context)</code></strong> —— 等待落定。结果
+  （<code>SettledSubmissionRecord</code>，<code>src/harness/types.ts:81</code>）只有两种终态：
+  <code>done</code>（有 <code>answer: EntryId</code>）或 <code>unanswered</code>（带 reason）。
+  注意 wait 只是等待的取消侧 —— 取消 context 只放弃这次等待，工作照常进行。</p>
+
+  <p><strong>⑦ 最后那次 commit —— 一个容易看走眼的点。</strong></p>
+  <pre><code>const answer = await root.commit((tx) =&gt; tx.entry(AssistantEntry, settled.answer), context);</code></pre>
+  <p>
+    这里的 <code>tx.entry(...)</code> <strong>不是写入，是读取</strong>。<code>Tx</code> 接口上
+    <code>entry</code> 有两个重载（<code>src/types.ts:793-795</code>）：按 ID 读原始条目；
+    或者带一个类型令牌读 —— <code>tx.entry(AssistantEntry, id)</code> 返回按 <code>pi.assistant</code>
+    类型收窄的 <code>TypedEntry</code>，类型不对则 <code>undefined</code>。
+    <code>settled.answer</code> 只是答案条目的 ID，这一步在事务里把它读出来；
+    <code>answer?.model?.[0]</code> 就是那条 AssistantMessage。
+    顺带学到 commit 的另一个性质：<strong>回调的返回值原样成为 <code>commit()</code> 的返回值</strong>，
+    所以 commit 不只能写，也能做事务性的一致读。
+  </p>
+
+  <p><strong>⑧ <code>harness.close(context)</code></strong> —— 关闭会先封住新提交、等正在跑的
+  任务代码返回、再关存储。被中断的工作保持 pending，下次打开存储再续（第 4 章）。</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="QuickStart 时序">
+      <text x="410" y="24" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">Quick Start 的调用时序（存储视角）</text>
+      <!-- lanes -->
+      <rect x="30" y="40" width="130" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--accent)"/>
+      <text x="95" y="62" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">你的代码</text>
+      <rect x="230" y="40" width="150" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)"/>
+      <text x="305" y="62" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">Harness/调度器</text>
+      <rect x="450" y="40" width="120" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--pass)"/>
+      <text x="510" y="62" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">Storage</text>
+      <rect x="640" y="40" width="150" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--warn)"/>
+      <text x="715" y="62" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">pi-ai → OpenAI</text>
+      <line x1="95" y1="74" x2="95" y2="270" style="stroke:var(--muted)" stroke-width="1" stroke-dasharray="3 3"/>
+      <line x1="305" y1="74" x2="305" y2="270" style="stroke:var(--muted)" stroke-width="1" stroke-dasharray="3 3"/>
+      <line x1="510" y1="74" x2="510" y2="270" style="stroke:var(--muted)" stroke-width="1" stroke-dasharray="3 3"/>
+      <line x1="715" y1="74" x2="715" y2="270" style="stroke:var(--muted)" stroke-width="1" stroke-dasharray="3 3"/>
+      <!-- arrows -->
+      <line x1="95" y1="105" x2="300" y2="105" style="stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <polygon points="305,105 295,100 295,110" style="fill:var(--fg-dim)"/>
+      <text x="200" y="97" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">root(agent)</text>
+      <line x1="305" y1="130" x2="505" y2="130" style="stroke:var(--pass)" stroke-width="1.5"/>
+      <polygon points="510,130 500,125 500,135" style="fill:var(--pass)"/>
+      <text x="407" y="122" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">commit：建会话 + pi.* 文档</text>
+      <line x1="95" y1="165" x2="300" y2="165" style="stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <polygon points="305,165 295,160 295,170" style="fill:var(--fg-dim)"/>
+      <text x="200" y="157" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">submit(input)</text>
+      <line x1="305" y1="190" x2="505" y2="190" style="stroke:var(--pass)" stroke-width="1.5"/>
+      <polygon points="510,190 500,185 500,195" style="fill:var(--pass)"/>
+      <text x="407" y="182" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">commit：pi.user + submission</text>
+      <line x1="305" y1="215" x2="710" y2="215" style="stroke:var(--warn)" stroke-width="1.5"/>
+      <polygon points="715,215 705,210 705,220" style="fill:var(--warn)"/>
+      <text x="510" y="207" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">pi.generation 发起流式请求</text>
+      <line x1="710" y1="240" x2="505" y2="240" style="stroke:var(--pass)" stroke-width="1.5"/>
+      <polygon points="510,240 520,235 520,245" style="fill:var(--pass)"/>
+      <text x="607" y="232" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">commit：pi.assistant（含答案）</text>
+      <line x1="95" y1="268" x2="300" y2="268" style="stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <polygon points="305,268 295,263 295,273" style="fill:var(--fg-dim)"/>
+      <text x="200" y="286" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">wait() 醒来：done + answer 条目 ID</text>
+    </svg>
+    <figcaption>你的代码只碰 Harness；模型请求由内置 generation 任务发出；一切状态变化都先成为 Storage 里的提交。</figcaption>
+  </figure>
+
+  <h2 id="sec-examples">3.3 跑仓库里的现成示例</h2>
+  <p>
+    <code>packages/durable/test/examples/</code> 下有 20 多个可运行示例，从 00 到 31 编号，
+    由浅入深。在 <code>packages/durable</code> 目录下这样跑（README 的方法，仓库内直接跑 TypeScript 源码）：
+  </p>
+  <pre><code>cd packages/durable
+node --conditions=source --experimental-strip-types test/examples/14-chat.ts</code></pre>
+  <ul>
+    <li>调 OpenAI 的示例需要 <code>OPENAI_API_KEY</code>；其余大多用 <strong>faux provider</strong>（假模型）跑，不需要任何 key。</li>
+    <li>值得按顺序看：<code>14-chat</code>（一问一答）、<code>20-inbox</code>（忙时排队）、<code>24-child-tasks</code>（子任务与重启）、<code>26-coding-agent</code>（接近真实产品形态）。</li>
+    <li><code>19-json.ts</code> 展示完整的事件流输出 —— 第 10 章讲 watchEvents 时会回头引用它。</li>
+  </ul>
+  <p>
+    另一个提醒：仓库测试要求 Node ≥ 22.19.0（<code>package.json:140-143</code> 的 engines 字段），
+    <code>--experimental-strip-types</code> 直接执行 .ts 源文件依赖较新的 Node。
+  </p>
+
+  <h2 id="sec-recap">3.4 本章回顾</h2>
+  <ul>
+    <li>骨架六步：open → root → submit → wait → commit(读答案) → close。</li>
+    <li>registry 必须用 <code>createRegistry()</code> 创建，否则 <code>Harness.open()</code> 校验失败。</li>
+    <li><code>root()</code> 首次调用在一个 commit 里创建根会话并写入五个 pi.* 文档。</li>
+    <li>submit 即接纳：输入立刻持久；回答由内置 generation 任务写入。</li>
+    <li><code>tx.entry(Token, id)</code> 是类型化读取重载；commit 回调的返回值即 commit 的返回值。</li>
+    <li>示例都在 <code>test/examples/</code>，faux provider 不需要 key。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>自己 new 一个空 registry 传给 open → 启动即抛 "Registry lacks built-in tasks"。</li>
+      <li>以为 <code>root()</code> 每次都新建会话 —— 只有第一次创建，之后返回同一个（ID=1）。</li>
+      <li>把 <code>settled.answer</code> 当成消息文本 —— 它是 EntryId，要再读一次条目。</li>
+      <li>忘记 <code>close()</code> —— 测试进程会挂着不退（调度器还活着）。</li>
+      <li>用 MemoryStorage 却期待跨进程续跑 —— 它什么都不持久化，第 4 章换后端。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="3">
+    <h2>第 3 章测试</h2>
+
+    <div class="q" data-id="3-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — registry 必须用 createRegistry() 创建，它预装内置任务；open 会校验。"
+         data-rationale="B 正确：Harness.open 校验 pi.generation/pi.tool/pi.compaction 在注册表中，缺失即抛错。A 反了；C 不必要；D 是合法的（models 支持函数形式），但与本错误无关。"
+         data-review="sec-lines">
+      <div class="prompt"><span class="qnum">Q1.</span> <code>Harness.open()</code> 抛出 "Registry lacks built-in tasks"，最可能的原因？</div>
+      <label class="opt"><input type="radio" name="q-3-1" value="a"> A. 存储路径不存在</label>
+      <label class="opt"><input type="radio" name="q-3-1" value="b"> B. 传了不是 createRegistry() 建的注册表，内置任务缺席</label>
+      <label class="opt"><input type="radio" name="q-3-1" value="c"> C. 没有设置 OPENAI_API_KEY</label>
+      <label class="opt"><input type="radio" name="q-3-1" value="d"> D. models 传了函数而不是对象</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C — 首次调用在一个 commit 里创建根会话并写入 pi.* 文档；此后返回同一个。"
+         data-rationale="C 正确。A 错：之后返回已有根会话；B 错：根 ID 恒为 1，跨进程重开也是它；D 错：root() 可带 agent 配置，是创建会话的便捷入口。"
+         data-review="sec-lines">
+      <div class="prompt"><span class="qnum">Q2.</span> 关于 <code>harness.root(context, { agent })</code>，哪句正确？</div>
+      <label class="opt"><input type="radio" name="q-3-2" value="a"> A. 每次调用都创建一个新的根会话</label>
+      <label class="opt"><input type="radio" name="q-3-2" value="b"> B. 根会话的 ID 每次打开存储都随机生成</label>
+      <label class="opt"><input type="radio" name="q-3-2" value="c"> C. 第一次调用在一个 commit 里创建根会话并写入五个 pi.* 文档，之后返回同一个</label>
+      <label class="opt"><input type="radio" name="q-3-2" value="d"> D. root() 只能读，不能带 agent 配置</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-3" data-type="mcq" data-correct='["b"]'
+         data-answer="B — 类型化读取：按 pi.assistant 类型收窄地读出答案条目。"
+         data-rationale="B 正确：Tx.entry 带类型令牌的重载是读，返回 TypedEntry 或 undefined。A 错（不是写入）；C 错（写入用 appendEntry）；D 错（commit 可带任意回调返回值）。"
+         data-review="sec-lines">
+      <div class="prompt"><span class="qnum">Q3.</span> Quick Start 最后的 <code>root.commit((tx) =&gt; tx.entry(AssistantEntry, settled.answer), context)</code> 里，<code>tx.entry(...)</code> 在做什么？</div>
+      <label class="opt"><input type="radio" name="q-3-3" value="a"> A. 追加一条 assistant 条目</label>
+      <label class="opt"><input type="radio" name="q-3-3" value="b"> B. 在事务里按类型令牌读取答案条目，返回收窄后的 TypedEntry</label>
+      <label class="opt"><input type="radio" name="q-3-3" value="c"> C. 修改 settled.answer 指向的条目</label>
+      <label class="opt"><input type="radio" name="q-3-3" value="d"> D. 什么都不做，纯占位</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-4" data-type="mcq" data-correct='["a"]'
+         data-answer="A — done（带 answer 的 EntryId）或 unanswered（带 reason）。"
+         data-rationale="A 是 SettledSubmissionRecord 的两种终态。B/C 都不是提交记录的状态；D 是 input 的 whenBusy 选项值。"
+         data-review="sec-lines">
+      <div class="prompt"><span class="qnum">Q4.</span> <code>submission.wait()</code> 的返回值可能是什么？</div>
+      <label class="opt"><input type="radio" name="q-3-4" value="a"> A. done 或 unanswered</label>
+      <label class="opt"><input type="radio" name="q-3-4" value="b"> B. placed 或 queued</label>
+      <label class="opt"><input type="radio" name="q-3-4" value="c"> C. completed 或 faulted</label>
+      <label class="opt"><input type="radio" name="q-3-4" value="d"> D. steer 或 followUp</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-5" data-type="fill" data-accepted='["pi.user","userentry","pi.user 条目","user"]'
+         data-answer="pi.user"
+         data-rationale="submit 接纳输入时写入 pi.user 条目（UserEntry，src/entries.ts:15）。"
+         data-review="sec-lines">
+      <div class="prompt"><span class="qnum">Q5.</span> 填空：<code>submit({ type: "input", ... })</code> 被接纳后，会话记录里新增的条目种类是 <code>______</code>。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-6" data-type="mcq" data-correct='["d"]'
+         data-answer="D — 提交回调的返回值原样成为 commit() 的返回值。"
+         data-rationale="D 正确，这正是 Quick Start 用一次 commit 拿到答案条目的原理。A 限制过死（可以返回任何值）；B 无此规则；C 与返回值无关。"
+         data-review="sec-lines">
+      <div class="prompt"><span class="qnum">Q6.</span> <code>conversation.commit(cb)</code> 的返回值是什么？</div>
+      <label class="opt"><input type="radio" name="q-3-6" value="a"> A. 永远是新条目的 ID</label>
+      <label class="opt"><input type="radio" name="q-3-6" value="b"> B. 永远是 void</label>
+      <label class="opt"><input type="radio" name="q-3-6" value="c"> C. 本次提交的 Seq</label>
+      <label class="opt"><input type="radio" name="q-3-6" value="d"> D. 提交回调的返回值（任意类型）</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-7" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A/B/D 都对：封装接纳与等待、重试同 requestId 幂等、重启后可 reacquire。C 错——接纳是持久的，wait 被取消不影响工作本身。"
+         data-review="sec-lines">
+      <div class="prompt"><span class="qnum">Q7.</span> 使用 Submission 对象（而非自己写条目）的好处有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-3-7" value="a"> A. 持久接纳：输入立刻落盘，不怕崩溃</label>
+      <label class="opt"><input type="checkbox" name="q-3-7" value="b"> B. requestId 去重：重试同一请求不会提交两次</label>
+      <label class="opt"><input type="checkbox" name="q-3-7" value="c"> C. 取消 wait 就能撤回已接纳的输入</label>
+      <label class="opt"><input type="checkbox" name="q-3-7" value="d"> D. 重启后 harness.submission(id) 能重新拿到它</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C — 大多数示例用 faux provider（假模型），无需 key；调 OpenAI 的才需要。"
+         data-rationale="C 正确（README 示例一节的说明）。A/B 以偏概全；D 与凭据无关。"
+         data-review="sec-examples">
+      <div class="prompt"><span class="qnum">Q8.</span> 在本仓库跑 <code>test/examples/</code> 的示例，凭据要求是？</div>
+      <label class="opt"><input type="radio" name="q-3-8" value="a"> A. 全部示例都需要 OPENAI_API_KEY</label>
+      <label class="opt"><input type="radio" name="q-3-8" value="b"> B. 全部都不需要任何凭据</label>
+      <label class="opt"><input type="radio" name="q-3-8" value="c"> C. 调 OpenAI 的需要 OPENAI_API_KEY，大多数示例用 faux provider 不需要</label>
+      <label class="opt"><input type="radio" name="q-3-8" value="d"> D. 需要登录 OpenAI 网页账号</label>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测试</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测试</button>
+  </form>
+
+  <p style="margin-top:2rem; color:var(--muted);">
+    下一章：<a href="04-storage-and-resume.html"><strong>第 4 章 — 持久化与恢复：四种存储后端</strong></a>。
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>
